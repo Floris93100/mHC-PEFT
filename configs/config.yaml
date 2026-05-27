@@ -1,0 +1,187 @@
+mode: train 
+seed: 34                                
+project_name: fomo                      # do not change: just project label
+run_name: debug                         #! change every experiment for
+                                        #! interpretable output folders
+
+model:
+                                        # this is called when mode = train
+                                        # base Hugging Face model
+                                        #! if applicable, also change at benchmark.checkpoint_path 
+                                        #! use allenai/OLMo-2-0425-1B or allenai/OLMo-2-1124-7B
+  pretrained_model_name_or_path: allenai/OLMo-2-0425-1B 
+  torch_dtype: bfloat16                 # do not change on A100; should saves memory
+  device_map: auto                      # do not change: HF puts stuff on GPU
+  trust_remote_code: true               # do not change: allows HF to use AllenAI code       
+  use_cache: false                      # do not change: disables generation
+                                        # key-value caching during training            
+
+method:
+  selected_method: shc                  #! choose: lora, ia3, dora, shc, frozen
+
+  shc_num_streams: 4                    # number of SHC residual streams
+  shc_sinkhorn_iterations: 20           # iterations for sinkhorn normalization
+  shc_sinkhorn_epsilon: 1e-6            # numerical stability for Sinkhorn
+  shc_train_wrapped_branch: false       # do not change: keeps OLMo frozen
+  shc_ablation_mapping: []              # for ablations to test impact of each mapping, either null, pre, res or post 
+  shc_softmax_readout: false            # if true, learn softmax weights for final stream readout
+
+  peft_lora_rank: 8                     # LoRA/DoRA low-rank dimension
+  peft_lora_alpha: 16                   # LoRA/DoRA update scaling
+  peft_lora_dropout: 0.05               # Dropout inside LoRA/DoRA adapters
+  peft_bias: none                       # do not change: train no bias terms
+  peft_target_modules:                  # OLMo modules adapted by PEFT:
+    - q_proj                            # attention query projection
+    - k_proj                            # "",,"" key "",,""
+    - v_proj                            # "",,"" value "",,""
+    - o_proj                            # "",,"" output "",,""
+    - up_proj                           # MLP up projection
+    - down_proj                         # "",,"" down "",,""
+    - gate_proj                         # "",,"" gate "",,""
+
+  peft_vera_rank: 8                     # VeRA rank
+  peft_vera_dropout: 0.05               # VeRA dropout
+  peft_vera_projection_prng_key: 343434 # fixed seed for VeRA random projections
+  peft_feedforward_modules:             # for IA3 
+    - up_proj
+    - down_proj
+    - gate_proj
+
+  prompt_tuning_num_virtual_tokens: 20  # number of trainable soft prompt tokens
+  prompt_tuning_init_text: null         # optional text used to initialize prompts
+
+  layer_tuning_train_last_n_layers: 1   # number of final decoder layers to train
+  layer_tuning_train_lm_head: false     # whether to also train the LM head
+  layer_tuning_train_norm: false        # whether to also train final norm
+  shc_dropout_res: 0.1                  # dropout p for H_res
+  shc_noise_std: 1e-2                   # initialization noise on H matrices
+  shc_dropout_stream: 0.0               # zero out entries X[b,t,s,d] with probability p
+
+data:
+                                        #! if possible, cache it first separately with CPU
+                                        #! using build_dataset_cache.py for efficiency
+  source_type: hf                       #! choose: hf for real data; tiny for tests
+                                        # supervised finetuning dataset
+  hf_dataset_name: allenai/tulu-3-sft-olmo-2-mixture
+  hf_dataset_subset: null               # do not change unless dataset has subsets
+  cached_dataset_dir: null              # set to reuse a saved fixed dataset split
+  tokenized_dataset_dir: null           # fixed tokenized split; skips tokenization
+  preprocessing_num_proc: 8             # parallel workers for tokenization
+  preprocessing_batch_size: 1000        # examples per map batch
+
+  packing_enabled: true                 # concatenate examples into full token blocks
+  packing_block_size: 2048              # do not change: usually same as max_sequence_length
+  packing_drop_remainder: true          # drop final incomplete token block (minor data loss for more speed)
+                                        # separate packed examples with EOS
+  packing_add_eos_between_examples: true
+  
+  train_split: train                    # HF split used for finetuning
+  eval_split: null                      # whether to use held-out split
+  input_format: chat                    # what format the data is, e.g., text or chat
+  messages_column_name: messages        
+  text_column_name: text                
+                                        #! 2048 for main experiments, 1024 for e.g. ablations;
+                                        #! in het Slackje, de "iets-minder-belangrijke experiments"
+  max_sequence_length: 2048             #! max. token length per example; only truncates 0.5% of samples
+  max_train_samples: 1000               # max. samples
+  max_eval_samples: null                # no limit for eval samples (for now)
+  stratify_max_samples: 20000           # total samples drawn in data
+
+  validation_samples: 1000              # fixed held-out validation examples
+  validation_split_strategy: random     # seeded random split
+  validation_seed: 343434               #! do not change across experiments
+
+  pad_to_max_length: false              #! true only for worst-case memory tests
+  pad_to_multiple_of: 64                # A100-friendly dynamic batch padding
+
+  test_samples: 1000                    # fixed held-out test examples
+                                        # saved validation/test row ids
+  split_indices_output_file: split_ids.json
+  split_indices_input_file: null        # use path existing split file for testing
+
+
+train:
+  enabled: true                         #! set to false while loading/evaluating model
+  seed: ${seed}                         # do not change: uses global seed
+  checkpoint_output_dir: checkpoints    # do not change: Trainer checkpoint folder
+                                        # do not change: where saved trainable params are
+  final_trainable_params_dir: final_model
+  num_train_epochs: 1                   # ignored when max_train_steps > 0
+  max_train_steps: 100                  # number of optimizer steps (main training length)
+  per_device_train_batch_size: 4        # batch size per GPU
+  gradient_accumulation_steps: 4        # effective batch = batch * accumulation
+  learning_rate: 1e-4                   # shared LR for fair PEFT comparison
+  shc_learning_rate: 3e-3               # best lr for SHC
+  lora_learning_rate: 1e-4              # best lr for LoRA 
+  use_dual_lr: false                    # default use of 1 lr training set up
+  weight_decay: 0.0                     # no weight decay by default for PEFT
+  logging_steps: 100                    # how often Trainer logs metrics
+  logging_first_step: true              # logs metrics at the first step too
+
+  report_to: tensorboard                # tensorboard settings
+  logging_dir: runs/${run_name}_${method.selected_method}
+  tensorboard_run_name: ${run_name}_${method.selected_method}
+
+                                        # do not change: avoids full checkpoints
+  save_strategy: "steps"                # can change to "steps" if we want to checkpoint
+  save_steps: 5000                      # save every x optimizer steps
+  save_total_limit: 1                   # safety *if* checkpointing is enabled
+  resume_from_checkpoint: null          # set path when resuming
+
+  disable_tqdm: false                   # set true for more clean SLURM logs
+  optimizer: adamw_torch                #! shared optimizer for all methods
+  lr_scheduler_type: cosine             #! shared LR schedule for all methods.
+  warmup_ratio: 0.03                    #! First 3% slowly increases LR:
+                                        #! stabilization for new PEFT params
+  max_grad_norm: 1.0                    # clips large gradients for stability
+  bf16: true                            # do not change on A100; use bfloat16
+  fp16: false                           # do not change when bf16 is true
+
+  eval_strategy: steps                  # validate *during* training
+  eval_steps: 2500                      # validate every x optimizer steps
+
+eval:                                   #! for separate eval *after* training
+  enabled: false                        # select if we want to have this in finetuning
+  output_dir: eval                      # evaluation output folder
+  per_device_eval_batch_size: 1         # eval batch size per GPU
+  metrics_output_file: metrics.json     # where eval metrics are saved   
+
+benchmark:                              
+                                        #! this is called when mode = benchmark
+                                        #! HF id or final_model dir to benchmark 
+                                        # use allenai/OLMo-2-0425-1B or allenai/OLMo-2-1124-7B
+  checkpoint_path: allenai/OLMo-2-0425-1B   
+  device: cuda                          # Device used by lm-eval
+  batch_size: auto                      # lm-eval batch size
+  limit: 10                             # max examples per task for a smoke test
+  harness_output_file: harness.json     # output file for benchmark results 
+  tasks:
+      hellaswag:
+        fewshot: 10
+        metric: acc_norm
+      # mmlu:
+      #   fewshot: 0
+      #   metric: acc
+      # gsm8k:
+      #   fewshot: 0
+      #   metric: exact_match         
+
+carbon_tracking:
+  enabled: false                        # boolean for carbon tracking
+  output_dir: carbon                    # carbon output folder
+  output_file: emissions.csv            # CodeCarbon emissions file
+  project_name: fomo                    # do not change: carbon project label
+                                        # carbon run ID
+  experiment_id: ${method.selected_method}_${run_name}
+
+hydra:
+  job:
+    chdir: true                         # switch to correct directory with hydra too
+  run:                                  
+                                        # unique run ID
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}_${run_name}_${method.selected_method}
+  sweep:                                
+                                        # sweep root directory
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}_${run_name}
+                                        # one folder per sweep job
+    subdir: ${hydra.job.num}_${method.selected_method}
