@@ -156,12 +156,26 @@ python main.py mode=benchmark benchmark.limit=10
 
 # change output file name
 python main.py mode=benchmark benchmark.harness_output_file=harness.json
+
+# change PEFT model to be benchmarked, for example (ia)^3
+python main.py \
+	method.selected_method=ia3 \
+	mode=benchmark \
+	benchmark.checkpoint_path=outputs/ia3-tulu-20k-olmo1b/23037766/final_model \
+	benchmark.batch_size=auto \
+
+# change benchmark task
+python main.py \
+    ~benchmark.tasks \
+    ++benchmark.tasks.hendrycks_math.fewshot=4 \
+    ++benchmark.tasks.hendrycks_math.metric=exact_match \
 ```
 
 what happens:
 - `run_benchmarks.py` resolves output paths back to the original working directory (so `harness.json` lands where you launched the command)
 - `benchmark.py` uses `lm_eval.simple_evaluate()` and writes a summary json (per task: fewshot, metric, rounded value)
 - `benchmark.checkpoint_path` can be either a hf model id or a local directory containing `reload_metadata.json` + `trainable_params.pt`
+- `benchmark.tasks` can be changed in order to evaluate on different benchmarks with different few-shot settings
 
 # Contact
 - Maintainer: F.P.J. de Kam

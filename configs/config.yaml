@@ -153,18 +153,12 @@ benchmark:
   checkpoint_path: allenai/OLMo-2-0425-1B   
   device: cuda                          # Device used by lm-eval
   batch_size: auto                      # lm-eval batch size
-  limit: 10                             # max examples per task for a smoke test
+  limit: null                           # max examples per task for a smoke test
   harness_output_file: harness.json     # output file for benchmark results 
   tasks:
       hellaswag:
         fewshot: 10
         metric: acc_norm
-      # mmlu:
-      #   fewshot: 0
-      #   metric: acc
-      # gsm8k:
-      #   fewshot: 0
-      #   metric: exact_match         
 
 carbon_tracking:
   enabled: false                        # boolean for carbon tracking
