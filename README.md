@@ -1,6 +1,6 @@
 # Manifold-Constrained Hyper-Connections for Efficient Finetuning (mHC-PEFT)
 
-This repo contains code for experiments from the paper *"Manifold-Constrained Hyper-Connections for Efficient Finetuning"*. The core idea is to use static manifold-constrained hyper-connections (shc) as a parameter-efficient finetuning method by wrapping a backbone llm (notably allenai olmo-2).
+This repo contains code for experiments from the paper *"Manifold-Constrained Hyper-Connections for Efficient Finetuning"*. Most parameter-efficient finetuning (PEFT) methods adapt weights or activations, thus leaving one of the key Transformer components unchanged: residual connections. This paper investigates Manifold-Constrained Hyper-Connections (mHC), a generalisation of residual connections, as a novel PEFT approach, wrapping a frozen OLMo-2-1B backbone with learned residual routing modules. With orders of magnitude fewer parameters than competing methods, the current mHC implementation achieves stable training but does not match other PEFT methods in training and downstream task performance. Nonetheless, analysis establishes residual routing as a distinct and underexplored consideration in finetuning, thus highlighting a promising direction forward. 
 
 ## Repo overview
 
