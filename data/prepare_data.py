@@ -50,6 +50,12 @@ def tokenize_dataset(dataset, tokenizer, cfg):
         else:
             raise ValueError(f"unknown data format: {cfg.input_format}")
 
+        if packing_enabled:
+            texts = [
+                maybe_add_eos(text, tokenizer, cfg)
+                for text in texts
+            ]
+
         return tokenizer(
             texts,
             truncation = not packing_enabled,
