@@ -17,7 +17,7 @@ model:
                                         # key-value caching during training            
 
 method:
-  selected_method: shc                  #! choose: lora, ia3, dora, shc, frozen
+  selected_method: shc                  #! choose: lora, ia3, dora, shc, frozen, vera, prompt_tuning, layer_tuning, shc_lora, shc_vera
 
   shc_num_streams: 4                    # number of SHC residual streams
   shc_sinkhorn_iterations: 20           # iterations for sinkhorn normalization
@@ -124,7 +124,7 @@ train:
 
                                         # do not change: avoids full checkpoints
   save_strategy: "steps"                # can change to "steps" if we want to checkpoint
-  save_steps: 5000                      # save every x optimizer steps
+  save_steps: 3000                      # save every x optimizer steps
   save_total_limit: 1                   # safety *if* checkpointing is enabled
   resume_from_checkpoint: null          # set path when resuming
 
@@ -138,7 +138,7 @@ train:
   fp16: false                           # do not change when bf16 is true
 
   eval_strategy: steps                  # validate *during* training
-  eval_steps: 2500                      # validate every x optimizer steps
+  eval_steps: 3000                      # validate every x optimizer steps
 
 eval:                                   #! for separate eval *after* training
   enabled: false                        # select if we want to have this in finetuning
