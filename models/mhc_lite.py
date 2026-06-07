@@ -345,7 +345,7 @@ class MHCLite(Module):
         # norm
         normed = rearrange(residuals, 'b ... s d -> b ... (s d)', s = streams)
         # normed = F.normalize(normed, dim = -1)
-        normed = self.norm(normed)
+        normed = self.norm(normed) 
 
         # alpha for weighted sum of residuals going into branch
         wc_weight = normed @ self.dynamic_alpha_fn # ... f (s*v + s!)
@@ -386,6 +386,7 @@ class MHCLite(Module):
             beta = dynamic_beta + static_beta
             beta = beta.sigmoid() * 2 # sigmoid * 2 for "H_post"
 
+    
         mix_h = einsum(alpha, residuals, '... f1 s f2 t, ... f1 s d -> ... f2 t d')
 
         if self.num_input_views == 1:
@@ -425,7 +426,7 @@ class MHCLite(Module):
         if self.channel_first:
             branch_output = rearrange(branch_output, 'b d ... -> b ... d')
 
-        output = einsum(branch_output, beta, 'b ... f1 d, b ... f1 s f2 -> b ... f2 s d')
+        output = einsum(branch_output, beta, 'b ... f1 d, b ... f1 s f2 -> b ... f2 s d') 
 
         output = rearrange(output, 'b ... s d -> (b s) ... d')
 

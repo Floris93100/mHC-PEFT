@@ -37,12 +37,13 @@ def inject_hyperconnections(model, method_cfg):
 
 #ADDED
 def inject_mhc_lite(model, method_cfg): 
+    device = next(model.parameters()).device
     freeze_base_model(model)
     return olmo_mhc_lite(model, 
                          num_streams=method_cfg.shc_num_streams,
                          num_fracs=method_cfg.mhc_num_fracs,
                          ablate_mapping = method_cfg.shc_ablation_mapping
-                         )
+                         ).to(device)
 
 
 def shc_lora(model, method_cfg): 
