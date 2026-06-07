@@ -479,7 +479,7 @@ def main():
         run_identity = not args.skip_identity,
         identity_atol = args.identity_atol,
         identity_layer_idx = args.identity_layer_idx,
-        skip_double_stochastic = args.skip_double_stochastic,,
+        skip_double_stochastic = args.skip_double_stochastic,
     )
 
     print(json.dumps(results, indent = 2))
