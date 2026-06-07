@@ -189,12 +189,7 @@ def check_gradients(model, tokenizer, batch_size = 1, seq_len = 32):
                 if not torch.isfinite(grad).all():
                     nonfinite_grad.append(name)
 
-                if (
-                    "pre_logits" in name
-                    or "post_logits" in name
-                    or "res_logits" in name
-                    or "readout_logits" in name
-                ):
+                if any(x in name for x in ("attn_hc", "mlp_hc", "readout_logits")):
                     shc_grad_names.append(name)
         else:
             if grad is not None:
@@ -405,6 +400,8 @@ def check_mhc(
     run_identity = True,
     identity_atol = 1e-4,
     identity_layer_idx = 0,
+    skip_double_stochastic = False,  
+
 ):
     """runs all quick shc diagnostics"""
     cfg.model.use_cache = False
@@ -427,7 +424,8 @@ def check_mhc(
         seq_len = seq_len,
     )
 
-    results["double_stochastic"] = check_double_stochastic(
+    if not skip_double_stochastic:
+        results["double_stochastic"] = check_double_stochastic(
         model = model,
         atol = atol,
     )
@@ -458,6 +456,7 @@ def main():
     parser.add_argument("--output", default = None)
                                         # optionally skip the identity test for speed
     parser.add_argument("--skip_identity", action = "store_true")
+    parser.add_argument("--skip_double_stochastic", action="store_true")
     parser.add_argument("--identity_atol", type = float, default = 1e-4)
     parser.add_argument("--identity_layer_idx", type = int, default = 0)
     args, overrides = parser.parse_known_args()
@@ -466,7 +465,7 @@ def main():
     cli_cfg = OmegaConf.from_dotlist(overrides)
     cfg = OmegaConf.merge(cfg, cli_cfg)
 
-    if cfg.method.selected_method.lower() not in ["shc", "shc_lora", "shc_vera"]:
+    if cfg.method.selected_method.lower() not in ["shc", "shc_lora", "shc_vera", "mhc_lite"]:
         raise ValueError(
             "diagnostics.py is intended for methods containing SHC. "
             f"got method.selected_method={cfg.method.selected_method}"
@@ -480,6 +479,7 @@ def main():
         run_identity = not args.skip_identity,
         identity_atol = args.identity_atol,
         identity_layer_idx = args.identity_layer_idx,
+        skip_double_stochastic = args.skip_double_stochastic,,
     )
 
     print(json.dumps(results, indent = 2))
