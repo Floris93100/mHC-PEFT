@@ -569,7 +569,10 @@ class KromHC(Module):
             self._last_h_res = h_res_diag.detach()
             self._last_h_post = h_post_diag.detach()
 
-        alpha = alpha.to(dtype)
+        alpha = alpha.to(residuals.dtype)   #Floris: changed to residuals.dtype
+        
+        if beta is not None:
+            beta = beta.to(residuals.dtype)
 
         mix_h = einsum(alpha, residuals, '... f1 s f2 t, ... f1 s d -> ... f2 t d')
 

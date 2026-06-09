@@ -55,8 +55,8 @@ method:
   layer_tuning_train_last_n_layers: 1   # number of final decoder layers to train
   layer_tuning_train_lm_head: false     # whether to also train the LM head
   layer_tuning_train_norm: false        # whether to also train final norm
-  shc_dropout_res: 0.1                  # dropout p for H_res
-  shc_noise_std: 1e-2                   # initialization noise on H matrices
+  shc_dropout_res: 0.0                  # dropout p for H_res
+  shc_noise_std: 1e-4                   # initialization noise on H matrices
   shc_dropout_stream: 0.0               # zero out entries X[b,t,s,d] with probability p
 
 data:

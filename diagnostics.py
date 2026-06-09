@@ -375,8 +375,12 @@ def check_identity_equivalence_model(
     rtol = 1e-4,
 ):
     """ check whether injected model preserves full model input-output behaviour """
-    cfg_base = OmegaConf.create(OmegaConf.to_container(cfg, resolve = True))
-    cfg_wrapped = OmegaConf.create(OmegaConf.to_container(cfg, resolve = True))
+    cfg_dict = {
+        k: v for k, v in OmegaConf.to_container(cfg, resolve=False).items()
+        if k != "hydra"
+    }
+    cfg_base = OmegaConf.create(cfg_dict)
+    cfg_wrapped = OmegaConf.create(cfg_dict)
 
     cfg_base.method.selected_method = "frozen"
     cfg_base.model.use_cache = False
