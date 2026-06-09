@@ -7,15 +7,15 @@ import torch.nn.functional as F
 import math
 
 class RMSNorm(nn.Module):
-    """Root-mean-square normalization layer."""
+    """ root-mean-square normalization layer """
     def __init__(self, dim, eps=1e-6):
-        """Initialize RMSNorm parameters."""
+        """ initialize RMSNorm parameters """
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        """Apply RMSNorm to input tensor."""
+        """ apply RMSNorm to input tensor """
         # rms = root mean square = sqrt( mean(x^2)+ eps )
         rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
         # normalize
@@ -23,7 +23,7 @@ class RMSNorm(nn.Module):
 
 
 def sinkhorn_logspace(logits, num_iters=20, eps=1e-6):
-    """Compute a doubly-stochastic matrix via Sinkhorn in log-space."""
+    """ compute a doubly-stochastic matrix via Sinkhorn in log-space """
     # logits: (B,T,n,n)
     z = logits.float()
     # numerical stabilization, prevent overflow in exp
@@ -45,7 +45,7 @@ def sinkhorn_logspace(logits, num_iters=20, eps=1e-6):
 
 class MHC(nn.Module):
     """
-    mHC wrapper based on the DeepSeek manifold Hyperconnections paper.
+    mHC wrapper based on the DeepSeek manifold Hyperconnections paper
 
     Maintains n parallel streams of shape (B, T, n, D). On each forward pass:
 
@@ -76,7 +76,7 @@ class MHC(nn.Module):
         init_std: float = 1e-3,
         train_branch: bool = False,
     ):
-        """Initialize the MHC wrapper and projection parameters."""
+        """ initialize the MHC wrapper and projection parameters """
         super().__init__()
         self.branch = branch 
         self.hidden_size = hidden_size
@@ -88,7 +88,7 @@ class MHC(nn.Module):
 
         flat_dim = num_streams * hidden_size
 
-        self.norm = RMSNorm(flat_dim, eps=eps)
+        self.norm = RMSNorm(flat_dim, eps = eps)
 
         # projection matrix for pre, post and res
         self.pre_proj = nn.Linear(flat_dim, num_streams)
@@ -103,15 +103,21 @@ class MHC(nn.Module):
         if not train_branch:
             for p in self.branch.parameters():
                 p.requires_grad = False
+        
+                                        # for diagnostics() getter function
+        self.diagnostics_enabled = False
+        self._last_h_pre = None         
+        self._last_h_res = None         
+        self._last_h_post = None        
 
         self.reset_parameters()
 
     def reset_parameters(self):
-        """Initialize projection weights and gating parameters."""
+        """ initialize projection weights and gating parameters """
         # tiny noise to break symmetry on weights
-        nn.init.normal_(self.pre_proj.weight, mean=0.0, std=self.init_std)
-        nn.init.normal_(self.post_proj.weight, mean=0.0, std=self.init_std)
-        nn.init.normal_(self.res_proj.weight, mean=0.0, std=self.init_std)
+        nn.init.normal_(self.pre_proj.weight, mean = 0.0, std = self.init_std)
+        nn.init.normal_(self.post_proj.weight, mean = 0.0, std = self.init_std)
+        nn.init.normal_(self.res_proj.weight, mean = 0.0, std = self.init_std)
 
         # initialise H_pre so that H_pre[i] is 1/n
         # p = 1/n
@@ -136,17 +142,44 @@ class MHC(nn.Module):
 
     # initialize streams with copies of the input
     def _init_streams(self, x):
-        """Initialize stream tensor by copying inputs across streams."""
+        """ initialize stream tensor by copying inputs across streams """
         X = x.unsqueeze(2).repeat(1, 1, self.num_streams, 1)
         return X
 
     @staticmethod
     def _extract_hidden(out):
-        """Extract hidden states from a model output tuple."""
+        """ extract hidden states from a model output tuple """
         return out[0] if isinstance(out, tuple) else out
 
+    def enable_diagnostics(self, enabled = True):
+        """ enable or disable caching of routing objects for diagnostics """
+        self.diagnostics_enabled = enabled
+        if not enabled:                 
+            self._last_h_pre = None
+            self._last_h_res = None
+            self._last_h_post = None
+
+
+    def diagnostics(self):
+        """ return latest dynamic routing objects for generic diagnostics """
+        if (
+            self._last_h_pre is None
+            or self._last_h_res is None
+            or self._last_h_post is None
+        ):
+            raise RuntimeError(
+                "no cached routing state found; run a forward pass before diagnostics()"
+            )
+
+        return {
+            "num_streams": self.num_streams,
+            "h_pre": self._last_h_pre,
+            "h_res": self._last_h_res,
+            "h_post": self._last_h_post,
+        }
+
     def forward(self, x, *args, **kwargs):
-        """Run the wrapped branch and update hyperconnection streams."""
+        """ run the wrapped branch and update hyperconnection streams """
         # x: (B,T,D)
         X = self._init_streams(x)                          # (B,T,n,D)
 
@@ -171,6 +204,12 @@ class MHC(nn.Module):
         h_pre = h_pre.to(dtype = X.dtype)
         h_post = h_post.to(dtype = X.dtype)
         h_res = h_res.to(dtype = X.dtype)
+
+                                        # for diagnostics() getter function
+        if self.diagnostics_enabled:
+            self._last_h_pre = h_pre.detach()
+            self._last_h_res = h_res.detach()
+            self._last_h_post = h_post.detach()
 
         # wrap the neural sub layer
         branch_in = torch.sum(h_pre.unsqueeze(-1) * X, dim=2)              # (B,T,D)

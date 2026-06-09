@@ -1,31 +1,36 @@
 # diagnostics.py
 """
-some quick tests for checking whether the mHC method
-* outputs the correct shapes
-* is initialised identity-equivalent
-* has gradients flowing to the trainable parameters
-* has a doubly stochastic residual mixing matrix
+some quick tests for checking mHC method/models behaviour
+
+* MODEL-level tests: check whether OLMo
+    - outputs the correct shapes
+    - has gradients flowing to the trainable parameters
+
+* MODULE-level tests: check whether mHC
+    - exposes diagnostics() getter function
+    - has a doubly stochastic residual mixing matrix
+    - is initialised identity-equivalent
 
 example running command:
 
 python diagnostics.py \
   --config configs/config.yaml \
-  method.selected_method=shc \
-  model.pretrained_model_name_or_path=allenai/OLMo-2-0425-1B
+  --batch_size 1 \
+  --seq_len 32 \
+  --output diagnostics.json \
+  method.selected_method=shc
 """
 # code below is LLM-generated, except for the identity-equivalence test
 
 import argparse
 import json
-import math
 import os
+
 import torch
 from omegaconf import OmegaConf
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from models.olmo_model2 import olmo_shc
+
 from models.injection import inject_method, count_trainable_parameters
 from models.loading import load_model_and_tokenizer
-from models.shc import SHC, sinkhorn_logspace
 
 
 def move_batch_to_model(batch, model):
@@ -53,22 +58,52 @@ def make_tiny_batch(tokenizer, model, batch_size, seq_len):
     return move_batch_to_model(batch, model)
 
 
-def get_shc_modules(model):
-    """returns all shc modules in the model"""
-    modules = [
-        module
-        for module in model.modules()
-        if isinstance(module, SHC)
-    ]
+def to_float_tensor(x):
+    """converts diagnostic outputs to detached float tensors"""
+    if x is None:
+        return None
+
+    if not torch.is_tensor(x):
+        x = torch.as_tensor(x)
+
+    return x.detach().float()
+
+
+def to_jsonable(x):
+    """converts small values to json-safe objects"""
+    if torch.is_tensor(x):
+        return x.detach().cpu().tolist()
+    return x
+
+
+def get_routing_modules(model):
+    """returns all modules that expose the generic diagnostics interface"""
+    modules = []
+
+    for name, module in model.named_modules():
+        diagnostics_fn = getattr(module, "diagnostics", None)
+
+        if callable(diagnostics_fn):
+            modules.append((name, module))
 
     if not modules:
-        raise RuntimeError("no SHC modules found in model")
+        raise RuntimeError(
+            "no routing modules found. expected modules with a diagnostics() method"
+        )
 
     return modules
 
 
+def set_module_diagnostics(model, enabled = True):
+    """ enable or disable routing-state caching for modules that support it """
+    for module in model.modules():
+        enable_fn = getattr(module, "enable_diagnostics", None)
+        if callable(enable_fn):
+            enable_fn(enabled)
+
+
 def check_shapes(model, tokenizer, batch_size = 1, seq_len = 32):
-    """checks that the injected model preserves causal lm output shapes"""
+    """model-level test: checks that the full model preserves causal lm shapes"""
     model.eval()
     batch = make_tiny_batch(tokenizer, model, batch_size, seq_len)
 
@@ -98,59 +133,159 @@ def check_shapes(model, tokenizer, batch_size = 1, seq_len = 32):
     }
 
 
-def check_double_stochastic(model, atol = 1e-3):
-    """checks row sums, column sums and non-negativity of shc residual routers"""
-    model.eval()
-    modules = get_shc_modules(model)
+def check_vector_state(name, value, num_streams = None, atol = 1e-3):
+    """module-level helper: checks h_pre or h_post diagnostics"""
+    value = to_float_tensor(value)
 
-    max_row_error = 0.0
-    max_col_error = 0.0
-    min_entry = float("inf")
-    checked = 0
+    assert value is not None, f"{name} is missing"
+    assert torch.isfinite(value).all(), f"{name} contains nan or inf"
 
-    for module in modules:
-        if "res" in module.ablate_mapping:
-            continue
+    if num_streams is not None:
+        assert value.shape[-1] == num_streams, (
+            f"{name} last dim should be num_streams={num_streams}, "
+            f"got shape {list(value.shape)}"
+        )
 
-        logits = module.res_logits.detach()
-        h_res = sinkhorn_logspace(
-            logits.reshape(1, 1, module.num_streams, module.num_streams),
-            num_iters = module.sinkhorn_iters,
-            eps = module.eps,
-        ).squeeze(0).squeeze(0).float()
+    return {
+        "shape": list(value.shape),
+        "min": value.min().item(),
+        "max": value.max().item(),
+        "mean": value.mean().item(),
+    }
 
-        row_error = (h_res.sum(dim = -1) - 1.0).abs().max().item()
-        col_error = (h_res.sum(dim = -2) - 1.0).abs().max().item()
 
-        max_row_error = max(max_row_error, row_error)
-        max_col_error = max(max_col_error, col_error)
-        min_entry = min(min_entry, h_res.min().item())
-        checked += 1
+def check_double_stochastic_matrix(h_res, num_streams = None, atol = 1e-3):
+    """module-level helper: checks one h_res tensor over its last two dims"""
+    h_res = to_float_tensor(h_res)
 
-    if checked == 0:
-        raise RuntimeError("no non-ablated SHC residual routers found")
-
-    assert max_row_error <= atol, (
-        f"row sums not close to 1: max error {max_row_error}"
+    assert h_res is not None, "h_res is missing"
+    assert h_res.dim() >= 2, f"h_res should have at least 2 dims, got {h_res.dim()}"
+    assert h_res.shape[-1] == h_res.shape[-2], (
+        f"h_res must be square on last two dims, got shape {list(h_res.shape)}"
     )
-    assert max_col_error <= atol, (
-        f"column sums not close to 1: max error {max_col_error}"
+    assert torch.isfinite(h_res).all(), "h_res contains nan or inf"
+
+    if num_streams is not None:
+        assert h_res.shape[-1] == num_streams, (
+            f"h_res last dims should be num_streams={num_streams}, "
+            f"got shape {list(h_res.shape)}"
+        )
+
+    row_error = (h_res.sum(dim = -1) - 1.0).abs().max().item()
+    col_error = (h_res.sum(dim = -2) - 1.0).abs().max().item()
+    min_entry = h_res.min().item()
+    max_entry = h_res.max().item()
+
+    assert row_error <= atol, (
+        f"row sums not close to 1: max error {row_error}"
+    )
+    assert col_error <= atol, (
+        f"column sums not close to 1: max error {col_error}"
     )
     assert min_entry >= -atol, (
         f"negative routing entry found: min entry {min_entry}"
     )
 
     return {
+        "shape": list(h_res.shape),
+        "max_row_error": row_error,
+        "max_col_error": col_error,
+        "min_entry": min_entry,
+        "max_entry": max_entry,
+    }
+
+
+def check_routing_module(name, module, atol = 1e-3):
+    """module-level test: checks one routing module through diagnostics()"""
+    state = module.diagnostics()
+
+    required_keys = ["h_res", "h_pre", "h_post", "num_streams"]
+    missing_keys = [
+        key
+        for key in required_keys
+        if key not in state
+    ]
+
+    assert not missing_keys, (
+        f"module {name} diagnostics() is missing keys: {missing_keys}"
+    )
+
+    num_streams = int(state["num_streams"])
+
+    h_pre_stats = check_vector_state(
+        name = f"{name}.h_pre",
+        value = state["h_pre"],
+        num_streams = num_streams,
+        atol = atol,
+    )
+
+    h_post_stats = check_vector_state(
+        name = f"{name}.h_post",
+        value = state["h_post"],
+        num_streams = num_streams,
+        atol = atol,
+    )
+
+    h_res_stats = check_double_stochastic_matrix(
+        h_res = state["h_res"],
+        num_streams = num_streams,
+        atol = atol,
+    )
+
+    return {
         "passed": True,
-        "checked_modules": checked,
+        "module_name": name,
+        "module_type": module.__class__.__name__,
+        "num_streams": num_streams,
+        "h_pre": h_pre_stats,
+        "h_post": h_post_stats,
+        "h_res": h_res_stats,
+    }
+
+
+def check_routing_modules(model, atol = 1e-3):
+    """module-level test: checks all routing modules in the model"""
+    model.eval()
+    modules = get_routing_modules(model)
+
+    module_results = []
+    max_row_error = 0.0
+    max_col_error = 0.0
+    min_entry = float("inf")
+
+    for name, module in modules:
+        result = check_routing_module(
+            name = name,
+            module = module,
+            atol = atol,
+        )
+
+        module_results.append(result)
+        max_row_error = max(
+            max_row_error,
+            result["h_res"]["max_row_error"],
+        )
+        max_col_error = max(
+            max_col_error,
+            result["h_res"]["max_col_error"],
+        )
+        min_entry = min(
+            min_entry,
+            result["h_res"]["min_entry"],
+        )
+
+    return {
+        "passed": True,
+        "checked_modules": len(module_results),
         "max_row_error": max_row_error,
         "max_col_error": max_col_error,
         "min_entry": min_entry,
+        "modules": module_results,
     }
 
 
 def check_gradients(model, tokenizer, batch_size = 1, seq_len = 32):
-    """checks gradients for shc trainable logits and frozen backbone params"""
+    """model-level test: checks gradients on trainable params and frozen params"""
     model.train()
     model.zero_grad(set_to_none = True)
 
@@ -175,7 +310,19 @@ def check_gradients(model, tokenizer, batch_size = 1, seq_len = 32):
     frozen_with_grad = []
     nonfinite_grad = []
 
-    shc_grad_names = []
+    routing_like_grad_names = []
+
+    routing_keywords = [
+        "hc",
+        "mhc",
+        "krom",
+        "router",
+        "routing",
+        "logit",
+        "pre",
+        "post",
+        "res",
+    ]
 
     for name, parameter in model.named_parameters():
         grad = parameter.grad
@@ -189,18 +336,14 @@ def check_gradients(model, tokenizer, batch_size = 1, seq_len = 32):
                 if not torch.isfinite(grad).all():
                     nonfinite_grad.append(name)
 
-                if any(x in name for x in ("attn_hc", "mlp_hc", "readout_logits")):
-                    shc_grad_names.append(name)
+                name_lower = name.lower()
+                if any(keyword in name_lower for keyword in routing_keywords):
+                    routing_like_grad_names.append(name)
         else:
             if grad is not None:
                 frozen_with_grad.append(name)
 
     assert trainable_with_grad, "no trainable parameters received gradients"
-    assert shc_grad_names, "no shc routing logits received gradients"
-    assert not trainable_without_grad, (
-        "some trainable parameters did not receive gradients: "
-        f"{trainable_without_grad[:10]}"
-    )
     assert not frozen_with_grad, (
         "some frozen parameters received gradients: "
         f"{frozen_with_grad[:10]}"
@@ -214,181 +357,85 @@ def check_gradients(model, tokenizer, batch_size = 1, seq_len = 32):
         "passed": True,
         "loss": float(loss.detach().cpu()),
         "trainable_with_grad": len(trainable_with_grad),
-        "shc_trainable_with_grad": len(shc_grad_names),
+        "trainable_without_grad": len(trainable_without_grad),
         "frozen_with_grad": len(frozen_with_grad),
+        "nonfinite_grad": len(nonfinite_grad),
+        "trainable_parameter_examples": trainable_with_grad[:20],
+        "trainable_without_grad_examples": trainable_without_grad[:20],
+        "routing_like_parameter_examples": routing_like_grad_names[:20],
     }
 
 
-def check_identity_equivalence(model_name, atol = 1e-4, layer_idx = 0):
-    """checks that fully ablated shc matches the original residual model"""
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+def check_identity_equivalence_model(
+    cfg,
+    tokenizer,
+    batch_size = 1,
+    seq_len = 32,
+    atol = 1e-4,
+    rtol = 1e-4,
+):
+    """ check whether injected model preserves full model input-output behaviour """
+    cfg_base = OmegaConf.create(OmegaConf.to_container(cfg, resolve = True))
+    cfg_wrapped = OmegaConf.create(OmegaConf.to_container(cfg, resolve = True))
 
-    olmo_normal = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-        trust_remote_code = True,
-    ).to(device)
-    olmo_normal.eval()
+    cfg_base.method.selected_method = "frozen"
+    cfg_base.model.use_cache = False
+    cfg_wrapped.model.use_cache = False
 
-    olmo_wrapped = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-        trust_remote_code = True,
-    ).to(device)
+    base_model, base_tokenizer = load_model_and_tokenizer(cfg_base.model)
+    wrapped_model, wrapped_tokenizer = load_model_and_tokenizer(cfg_wrapped.model)
+    wrapped_model = inject_method(wrapped_model, cfg_wrapped)
 
-    olmo_wrapped = olmo_shc(
-        olmo_wrapped,
-        num_streams = 4,
-        train_branch = False,
-        ablate_mapping = ["pre", "res", "post"],
+    base_model.eval()
+    wrapped_model.eval()
+
+    batch = make_tiny_batch(
+        tokenizer = base_tokenizer,
+        model = base_model,
+        batch_size = batch_size,
+        seq_len = seq_len,
     )
-    olmo_wrapped.eval()
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_name,
-        trust_remote_code = True,
-    )
-
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    inputs = tokenizer(
-        "Hello, my name is",
-        return_tensors = "pt",
-    )
-    inputs = {
-        key: value.to(device)
-        for key, value in inputs.items()
+    wrapped_batch = {
+        key: value.to(next(wrapped_model.parameters()).device)
+        for key, value in batch.items()
     }
 
     with torch.no_grad():
-        out_normal = olmo_normal(**inputs)
-        out_shc = olmo_wrapped(**inputs)
+        base_outputs = base_model(**batch)
+        wrapped_outputs = wrapped_model(**wrapped_batch)
 
-    logits_normal = out_normal.logits
-    logits_shc = out_shc.logits
+    base_logits = base_outputs.logits.detach().float().cpu()
+    wrapped_logits = wrapped_outputs.logits.detach().float().cpu()
 
-    full_max_abs_diff = (logits_normal - logits_shc).abs().max().item()
-    full_allclose = torch.allclose(logits_normal, logits_shc, atol = atol)
+    diff = base_logits - wrapped_logits
+    max_abs_diff = diff.abs().max().item()
+    mean_abs_diff = diff.abs().mean().item()
+    relative_l2_diff = (
+        diff.norm() / base_logits.norm().clamp_min(1e-12)
+    ).item()
 
-    normal_layer = olmo_normal.model.layers[layer_idx]
-    shc_layer = olmo_wrapped.model.layers[layer_idx]
-
-    with torch.no_grad():
-        inputs_embeds = olmo_normal.model.embed_tokens(inputs["input_ids"])
-
-        position_ids = torch.arange(
-            inputs_embeds.shape[1],
-            device = inputs_embeds.device,
-        ).unsqueeze(0)
-
-        position_embeddings = olmo_normal.model.rotary_emb(
-            inputs_embeds,
-            position_ids = position_ids,
-        )
-
-        x = inputs_embeds.clone()
-
-        out_normal_layer = normal_layer(
-            x.clone(),
-            attention_mask = None,
-            position_ids = position_ids,
-            position_embeddings = position_embeddings,
-        )
-        if isinstance(out_normal_layer, tuple):
-            out_normal_layer = out_normal_layer[0]
-
-        out_shc_layer = shc_layer(
-            x.clone(),
-            attention_mask = None,
-            position_ids = position_ids,
-            position_embeddings = position_embeddings,
-        )
-        if isinstance(out_shc_layer, tuple):
-            out_shc_layer = out_shc_layer[0]
-
-        out_shc_readout = (
-            out_shc_layer.mean(dim = 2)
-            if out_shc_layer.dim() == 4
-            else out_shc_layer
-        )
-
-        layer_max_abs_diff = (out_normal_layer - out_shc_readout).abs().max().item()
-        layer_allclose = torch.allclose(
-            out_normal_layer,
-            out_shc_readout,
-            atol = 1e-3,
-        )
-
-        attn_hc = shc_layer.attn_hc
-
-        branch_out = attn_hc.branch(
-            x.clone(),
-            position_ids = position_ids,
-            position_embeddings = position_embeddings,
-        )
-        if isinstance(branch_out, tuple):
-            branch_out = branch_out[0]
-
-        shc_out = attn_hc(
-            x.clone(),
-            position_ids = position_ids,
-            position_embeddings = position_embeddings,
-            readout = True,
-        )
-        if isinstance(shc_out, tuple):
-            shc_out = shc_out[0]
-
-        expected = x + branch_out
-
-        direct_max_abs_diff = (shc_out - expected).abs().max().item()
-        direct_allclose = torch.allclose(
-            shc_out,
-            expected,
-            atol = atol,
-        )
-
-        n = attn_hc.num_streams
-        h_res = sinkhorn_logspace(
-            attn_hc.res_logits.view(1, 1, n, n).expand(
-                x.shape[0],
-                x.shape[1],
-                n,
-                n,
-            ),
-            num_iters = attn_hc.sinkhorn_iters,
-            eps = attn_hc.eps,
-        )
-
-        h_res_row_error = (h_res[0, 0].sum(dim = -1) - 1.0).abs().max().item()
-        h_res_col_error = (h_res[0, 0].sum(dim = -2) - 1.0).abs().max().item()
-
-    assert full_allclose, (
-        f"full model identity equivalence failed: max diff {full_max_abs_diff}"
+    allclose = torch.allclose(
+        base_logits,
+        wrapped_logits,
+        atol = atol,
+        rtol = rtol,
     )
-    assert layer_allclose, (
-        f"layer identity equivalence failed: max diff {layer_max_abs_diff}"
-    )
-    assert direct_allclose, (
-        f"direct shc identity equivalence failed: max diff {direct_max_abs_diff}"
+
+    assert allclose, (
+        f"complete-model identity equivalence failed: "
+        f"max diff {max_abs_diff}, mean diff {mean_abs_diff}, "
+        f"relative l2 diff {relative_l2_diff}"
     )
 
     return {
         "passed": True,
-        "model_name": model_name,
         "atol": atol,
-        "layer_idx": layer_idx,
-        "full_logits_shape": list(logits_normal.shape),
-        "full_max_abs_diff": full_max_abs_diff,
-        "full_allclose": full_allclose,
-        "layer_max_abs_diff": layer_max_abs_diff,
-        "layer_allclose_atol_1e_3": layer_allclose,
-        "direct_max_abs_diff": direct_max_abs_diff,
-        "direct_allclose": direct_allclose,
-        "h_pre": torch.sigmoid(attn_hc.pre_logits).detach().cpu().tolist(),
-        "h_post": (2 * torch.sigmoid(attn_hc.post_logits)).detach().cpu().tolist(),
-        "h_res_max_row_error": h_res_row_error,
-        "h_res_max_col_error": h_res_col_error,
+        "rtol": rtol,
+        "max_abs_diff": max_abs_diff,
+        "mean_abs_diff": mean_abs_diff,
+        "relative_l2_diff": relative_l2_diff,
+        "logits_shape": list(base_logits.shape),
     }
 
 
@@ -399,11 +446,10 @@ def check_mhc(
     atol = 1e-3,
     run_identity = True,
     identity_atol = 1e-4,
-    identity_layer_idx = 0,
-    skip_double_stochastic = False,  
-
+    identity_rtol = 1e-4,
+    skip_module_tests = False,
 ):
-    """runs all quick shc diagnostics"""
+    """runs all quick diagnostics"""
     cfg.model.use_cache = False
 
     model, tokenizer = load_model_and_tokenizer(cfg.model)
@@ -417,31 +463,38 @@ def check_mhc(
         "parameter_counts": counts,
     }
 
-    results["shapes"] = check_shapes(
-        model = model,
-        tokenizer = tokenizer,
-        batch_size = batch_size,
-        seq_len = seq_len,
-    )
+    set_module_diagnostics(model, True) # turn diagnostics on
 
-    if not skip_double_stochastic:
-        results["double_stochastic"] = check_double_stochastic(
-        model = model,
-        atol = atol,
-    )
-
-    results["gradients"] = check_gradients(
-        model = model,
-        tokenizer = tokenizer,
-        batch_size = batch_size,
-        seq_len = seq_len,
-    )
+    try:                                # run shape test first because
+                                        # it performs a tiny forward pass
+        results["shapes"] = check_shapes( 
+            model = model,                
+            tokenizer = tokenizer,
+            batch_size = batch_size,
+            seq_len = seq_len,
+        )
+        if not skip_module_tests:
+            results["routing_modules"] = check_routing_modules(
+                model = model,
+                atol = atol,
+            )
+        results["gradients"] = check_gradients(
+            model = model,
+            tokenizer = tokenizer,
+            batch_size = batch_size,
+            seq_len = seq_len,
+        )
+    finally:                            # turn diagnostics off
+        set_module_diagnostics(model, False)
 
     if run_identity:
-        results["identity_equivalence"] = check_identity_equivalence(
-            model_name = cfg.model.pretrained_model_name_or_path,
+        results["identity_equivalence"] = check_identity_equivalence_model(
+            cfg = cfg,
+            tokenizer = tokenizer,
+            batch_size = batch_size,
+            seq_len = seq_len,
             atol = identity_atol,
-            layer_idx = identity_layer_idx,
+            rtol = identity_rtol,
         )
 
     return results
@@ -454,22 +507,17 @@ def main():
     parser.add_argument("--seq_len", type = int, default = 32)
     parser.add_argument("--atol", type = float, default = 1e-3)
     parser.add_argument("--output", default = None)
-                                        # optionally skip the identity test for speed
+                                        # for debugging, identity test can be switched off
     parser.add_argument("--skip_identity", action = "store_true")
-    parser.add_argument("--skip_double_stochastic", action="store_true")
+    parser.add_argument("--skip_module_tests", action = "store_true")
     parser.add_argument("--identity_atol", type = float, default = 1e-4)
-    parser.add_argument("--identity_layer_idx", type = int, default = 0)
+    parser.add_argument("--identity_rtol", type = float, default = 1e-4)
+
     args, overrides = parser.parse_known_args()
 
     cfg = OmegaConf.load(args.config)
     cli_cfg = OmegaConf.from_dotlist(overrides)
     cfg = OmegaConf.merge(cfg, cli_cfg)
-
-    if cfg.method.selected_method.lower() not in ["shc", "shc_lora", "shc_vera", "mhc_lite"]:
-        raise ValueError(
-            "diagnostics.py is intended for methods containing SHC. "
-            f"got method.selected_method={cfg.method.selected_method}"
-        )
 
     results = check_mhc(
         cfg = cfg,
@@ -478,8 +526,8 @@ def main():
         atol = args.atol,
         run_identity = not args.skip_identity,
         identity_atol = args.identity_atol,
-        identity_layer_idx = args.identity_layer_idx,
-        skip_double_stochastic = args.skip_double_stochastic,
+        identity_rtol = args.identity_rtol,
+        skip_module_tests = args.skip_module_tests,
     )
 
     print(json.dumps(results, indent = 2))

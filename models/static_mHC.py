@@ -7,7 +7,7 @@ import math
 
 
 def sinkhorn_logspace(logits, num_iters=20, eps=1e-6, tol=1e-4):
-    """Compute a doubly-stochastic matrix via Sinkhorn in log-space."""
+    """ compute a doubly-stochastic matrix via Sinkhorn in log-space """
     # check if input is positive
     #assert (logits >= 0).all(), f"Sinkhorn input has negative values: min={logits.min().item()}"
     # logits: (B,T,n,n)
@@ -37,7 +37,7 @@ def sinkhorn_logspace(logits, num_iters=20, eps=1e-6, tol=1e-4):
 
 class SHC(nn.Module):
     """
-    Static Hyper-Connections wrapper.
+    Static Hyper-Connections wrapper
 
     Minimal rewrite of the MHC class:
     - removes input-dependent (dynamic) projections
@@ -57,7 +57,7 @@ class SHC(nn.Module):
         dropout_res: float = 0.1,
         noise_std: float = 1e-2
     ):
-        """Initialize static hyperconnection parameters and wrapped branch."""
+        """ initialize static hyperconnection parameters and wrapped branch """
         super().__init__()
         self.branch = branch
         self.hidden_size = hidden_size
@@ -89,7 +89,7 @@ class SHC(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
-        """Initialize static gate/residual logits and apply ablations."""
+        """ initialize static gate/residual logits and apply ablations """
         # pre_logits: target h_pre[s] = 1/n + small noise, renormalize after
         pre_target = 1.0 / self.num_streams
         pre_bias = math.log(pre_target / (1.0 - pre_target))
@@ -120,17 +120,66 @@ class SHC(nn.Module):
             self.res_logits.requires_grad = False
 
     def _init_streams(self, x):
-        """Initialize stream tensor by copying inputs across streams."""
+        """ initialize stream tensor by copying inputs across streams """
         # initialize streams with copies of the input
         return x.unsqueeze(2).repeat(1, 1, self.num_streams, 1)
 
     @staticmethod
     def _extract_hidden(out):
-        """Extract hidden states from a model output tuple."""
+        """ extract hidden states from a model output tuple """
         return out[0] if isinstance(out, tuple) else out
 
+    def get_h_pre(self):
+        """ return effective static read-in gate used by the current forward pass """
+        if "pre" in self.ablate_mapping:
+            return torch.full(
+                (self.num_streams,),
+                1.0 / self.num_streams,
+                device = self.pre_logits.device,
+                dtype = self.pre_logits.dtype,
+            )
+
+        return torch.sigmoid(self.pre_logits)
+
+    def get_h_res(self):
+        """ return effective static residual routing matrix used by the current forward pass """
+        if "res" in self.ablate_mapping:
+            return torch.eye(
+                self.num_streams,
+                device = self.res_logits.device,
+                dtype = self.res_logits.dtype,
+            )
+
+        h_res = sinkhorn_logspace(
+            self.res_logits.view(1, 1, self.num_streams, self.num_streams),
+            num_iters = self.sinkhorn_iters,
+            eps = self.eps,
+        )
+
+        return h_res.squeeze(0).squeeze(0)
+
+    def get_h_post(self):
+        """ return effective static write-out gate used by the current forward pass """
+        if "post" in self.ablate_mapping:
+            return torch.ones(
+                self.num_streams,
+                device = self.post_logits.device,
+                dtype = self.post_logits.dtype,
+            )
+
+        return 2.0 * torch.sigmoid(self.post_logits)
+
+    def diagnostics(self):
+        """ return routing objects for generic diagnostics """
+        return {
+            "num_streams": self.num_streams,
+            "h_pre": self.get_h_pre().detach(),
+            "h_res": self.get_h_res().detach(),
+            "h_post": self.get_h_post().detach(),
+        }
+
     def forward(self, x, *args, readout=False, **kwargs):
-        """Run the wrapped branch and update static hyperconnection streams."""
+        """ run the wrapped branch and update static hyperconnection streams """
         # accept either a single hidden state tensor or an existing stream tensor
         if x.dim() == 3:
             X = self._init_streams(x)  # [b, t, d] -> [b, t, n, d]

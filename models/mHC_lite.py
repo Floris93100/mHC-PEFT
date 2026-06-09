@@ -304,6 +304,12 @@ class MHCLite(Module):
 
             self.h_post_scale = nn.Parameter(torch.ones(()) * 1e-2)
 
+                                        # for diagnostics() getter function
+        self.diagnostics_enabled = False
+        self._last_h_pre = None
+        self._last_h_res = None
+        self._last_h_post = None
+
         # dropouts
 
         self.dropout = nn.Dropout(dropout)
@@ -321,6 +327,34 @@ class MHCLite(Module):
         # needed for memory lanes a la RMT / LMM
 
         self.depth_residual_fn = depth_residual_fn
+
+    def enable_diagnostics(self, enabled = True):
+        """ enable or disable caching of routing objects for diagnostics """
+        self.diagnostics_enabled = enabled
+
+        if not enabled:
+            self._last_h_pre = None
+            self._last_h_res = None
+            self._last_h_post = None
+
+    def diagnostics(self):
+        """ return latest mHC-lite routing objects for generic diagnostics """
+        if (
+            self._last_h_pre is None
+            or self._last_h_res is None
+            or self._last_h_post is None
+        ):
+            raise RuntimeError(
+                "no cached routing state found; call enable_diagnostics(True) "
+                "and run a forward pass before diagnostics()"
+            )
+
+        return {
+            "num_streams": self.num_residual_streams,
+            "h_pre": self._last_h_pre,
+            "h_res": self._last_h_res,
+            "h_post": self._last_h_post,
+        }
 
     def width_connection(
         self,
@@ -390,6 +424,25 @@ class MHCLite(Module):
 
             beta = dynamic_beta + static_beta
             beta = beta.sigmoid() * 2 # sigmoid * 2 for "H_post"
+
+        if self.diagnostics_enabled:    # for diagnostics() getter function
+            if self.num_fracs != 1:
+                raise RuntimeError(
+                    "diagnostics for MHCLite currently expects num_fracs == 1"
+                )
+            if self.num_input_views != 1:
+                raise RuntimeError(
+                    "diagnostics for MHCLite currently expects num_input_views == 1"
+                )
+            h_pre_diag = alpha_pre.squeeze(-1).squeeze(-1)
+            h_res_diag = alpha_residual.squeeze(-2)
+            if beta is None:
+                h_post_diag = torch.ones_like(h_pre_diag)
+            else:
+                h_post_diag = beta.squeeze(-1)
+            self._last_h_pre = h_pre_diag.detach()
+            self._last_h_res = h_res_diag.detach()
+            self._last_h_post = h_post_diag.detach()
 
         alpha = alpha.to(dtype)
 
