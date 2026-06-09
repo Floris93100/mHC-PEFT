@@ -324,6 +324,7 @@ class MHCLite(Module):
         residuals
     ):
         streams = self.num_residual_streams
+        dtype = residuals.dtype
 
         maybe_transformed_residuals = self.residual_transform(residuals)
 
@@ -346,9 +347,10 @@ class MHCLite(Module):
         normed = rearrange(residuals, 'b ... s d -> b ... (s d)', s = streams)
         # normed = F.normalize(normed, dim = -1)
         normed = self.norm(normed) 
+        normed = normed.to(dtype)
 
         # alpha for weighted sum of residuals going into branch
-        wc_weight = normed @ self.dynamic_alpha_fn # ... f (s*v + s!)
+        wc_weight = normed @ self.dynamic_alpha_fn.to(dtype) # ... f (s*v + s!)
         psize = self.num_input_views * streams
         dynamic_pre, dynamic_residual = wc_weight[..., :psize], wc_weight[..., psize:]
         static_pre  , static_residual   = self.static_alpha[:psize], self.static_alpha[psize:]
@@ -358,13 +360,13 @@ class MHCLite(Module):
             _perm_mats = get_all_permutations(streams).to(dev)
             perm_mats[(streams, dev)] = _perm_mats
         perms = perm_mats[(streams, dev)]
-        res_coeff = self.residual_scale * dynamic_residual + static_residual
+        res_coeff = self.residual_scale.to(dtype) * dynamic_residual + static_residual.to(dtype)
         res_coeff = torch.softmax(res_coeff, dim = -1)
-        alpha_residual = einsum(res_coeff, perms, '... r, r i j-> ... i j') # (..., s, s)
+        alpha_residual = einsum(res_coeff, perms.to(dtype), '... r, r i j-> ... i j') # (..., s, s)
         alpha_residual = self.split_fracs(alpha_residual) # (..., f, s, f, s)
         
         # (..., f, s, f, v)
-        alpha_pre = self.pre_branch_scale * dynamic_pre + static_pre  # (..., s*v)
+        alpha_pre = self.pre_branch_scale.to(dtype) * dynamic_pre + static_pre.to(dtype)  # (..., s*v)
         alpha_pre = rearrange(alpha_pre, '... (f s v) -> ... s f v', v = self.num_input_views, f = self.num_fracs)
         alpha_pre = alpha_pre.sigmoid()
 
@@ -376,17 +378,18 @@ class MHCLite(Module):
 
         beta = None
         if self.add_branch_out_to_residual:
-            dc_weight = normed @ self.dynamic_beta_fn # ... (s f)
+            dc_weight = normed @ self.dynamic_beta_fn.to(dtype) # ... (s f)
             dc_weight = rearrange(dc_weight, '... (s f) -> ... s f', s = streams)
 
-            dynamic_beta = dc_weight * self.h_post_scale
+            dynamic_beta = dc_weight * self.h_post_scale.to(dtype)
 
-            static_beta = rearrange(self.static_beta, '... (s f) -> ... s f', s = streams)
+            static_beta = rearrange(self.static_beta.to(dtype), '... (s f) -> ... s f', s = streams)
 
             beta = dynamic_beta + static_beta
             beta = beta.sigmoid() * 2 # sigmoid * 2 for "H_post"
 
-    
+        alpha = alpha.to(dtype)
+
         mix_h = einsum(alpha, residuals, '... f1 s f2 t, ... f1 s d -> ... f2 t d')
 
         if self.num_input_views == 1:
@@ -406,6 +409,9 @@ class MHCLite(Module):
         if self.channel_first:
             residuals = rearrange(residuals, 'b ... d -> b d ...')
         residuals = self.merge_fracs(residuals)
+
+        print("branch_input shape:", branch_input.shape)
+
         return branch_input, residuals, dict(beta = beta)
 
     def depth_connection(
@@ -418,7 +424,8 @@ class MHCLite(Module):
         assert self.add_branch_out_to_residual
 
         # maybe split fractions
-
+        dtype = residuals.dtype
+        branch_output = branch_output.to(dtype)
         branch_output = self.split_fracs(branch_output)
 
         # 'depth' connection

@@ -167,6 +167,7 @@ class MHCLiteOlmoDecoderLayer(nn.Module):
             layer_index=layer_index,
         )
 
+        
         self.attn_hc = init_hyper_conn(branch=_OlmoAttentionBranch(base_layer))
         self.mlp_hc  = init_hyper_conn(branch=_OlmoMLPBranch(base_layer))
 
@@ -181,6 +182,7 @@ class MHCLiteOlmoDecoderLayer(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         """Run attention and MLP MHCLite branches for a decoder layer."""
+        print("hidden_states shape entering attn_hc:", hidden_states.shape)
         hidden_states = self.attn_hc(
             hidden_states,
             attention_mask=attention_mask,
@@ -461,14 +463,15 @@ class MHCLiteOlmoModel(Olmo2Model):
             position_ids=position_ids,
         )
         position_embeddings = self.rotary_emb(inputs_embeds, position_ids=position_ids)
+        
 
         # expand: (B,T,D) → (B*s,T,D)
         hidden_states = self.expand_stream(inputs_embeds)
 
         # attention_mask and position_ids must match the expanded batch size
-        if causal_mask is not None:
-            causal_mask = causal_mask.repeat_interleave(self.num_streams, dim=0)
-        position_ids = position_ids.repeat_interleave(self.num_streams, dim=0)
+        #if causal_mask is not None:
+            #causal_mask = causal_mask.repeat_interleave(self.num_streams, dim=0)
+        #position_ids = position_ids.repeat_interleave(self.num_streams, dim=0)
 
         for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
             hidden_states = decoder_layer(
