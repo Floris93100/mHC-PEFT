@@ -596,7 +596,12 @@ class KromHCOlmoModel(Olmo2Model):
         )
 
 
-def olmo_kromhc(olmo: nn.Module, num_streams: int = 4, num_fracs: int = 1):
+def olmo_kromhc(
+    olmo: nn.Module, 
+    num_streams: int = 4, 
+    num_fracs: int = 1,
+    ablate_mapping = None
+):
     """Replace olmo.model with a KromHC-based model (no double residual)."""
     hidden_size = olmo.config.hidden_size
     olmo.model = KromHCOlmoModel(
