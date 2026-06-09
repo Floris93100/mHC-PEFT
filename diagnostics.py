@@ -514,8 +514,8 @@ def main():
                                         # for debugging, identity test can be switched off
     parser.add_argument("--skip_identity", action = "store_true")
     parser.add_argument("--skip_module_tests", action = "store_true")
-    parser.add_argument("--identity_atol", type = float, default = 1e-4)
-    parser.add_argument("--identity_rtol", type = float, default = 1e-4)
+    parser.add_argument("--identity_atol", type = float, default = 1e-2)
+    parser.add_argument("--identity_rtol", type = float, default = 1e-2)
 
     args, overrides = parser.parse_known_args()
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 from typing import Callable
 
+import math
 from functools import partial
 from random import randrange
 
@@ -261,9 +262,33 @@ class MHCLite(Module):
             perm_mats[(num_residual_streams, "cpu")] = _perm_mats
         perms = perm_mats[(num_residual_streams, "cpu")]
 
-        init_alpha0 = torch.ones((num_residual_streams_fracs, num_input_views_fracs)) * -1
-        init_alpha0[init_residual_index, :] = 1.
-        init_alpha1 = torch.ones(len(perms) * num_fracs) * -8
+        # H_pre read: one-hot selection of stream `init_residual_index` (HC Eq.14
+        # A_m = e_{k mod n}) realised through sigmoid. The selected logit is large; the
+        # off-stream logits are set so that sum_s sigmoid(.) = 1 *exactly*
+        # (sigma(sel) + (n-1) * sigma(off) = 1), i.e. branch_input == x at init, while
+        # the per-layer one-hot pattern is preserved. The one-hot gates the backward
+        # gradient per stream (only the selected stream gets read-path gradient, and the
+        # selection differs per layer), which breaks stream-permutation symmetry and lets
+        # n>1 streams differentiate -- the symmetry break cannot come from H_post/H_res,
+        # which are forced symmetric by the equivalence conditions.
+        pre_sel = 8.0
+        _sig_sel = 1.0 / (1.0 + math.exp(-pre_sel))
+        if num_residual_streams > 1:
+            _p_off = (1.0 - _sig_sel) / (num_residual_streams - 1)
+            pre_off = math.log(_p_off / (1.0 - _p_off))
+        else:
+            pre_off = pre_sel
+        init_alpha0 = torch.full((num_residual_streams_fracs, num_input_views_fracs), float(pre_off))
+        init_alpha0[init_residual_index, :] = float(pre_sel)
+        # H_res: a convex combination of permutation matrices is doubly stochastic by
+        # construction (row/col sums = 1), so its action on *equal* streams is the
+        # identity exactly, regardless of the logits -- H_res need not be close to I for
+        # init-equivalence. We still bias the softmax onto the identity permutation
+        # (index 0) so training STARTS from a plain residual rather than a permutation or
+        # mixture (HC Eq.14 A_r = I). -12 keeps the identity weight > 0.9998 even against
+        # the n! = 24 competitors for n=4; H_res is mHC's highest-value mapping (Table 1),
+        # so we keep it near I without fully saturating its gradient.
+        init_alpha1 = torch.ones(len(perms) * num_fracs) * -12.
         init_alpha1[0] = 0.
 
         # (s*v + s!)
@@ -288,8 +313,10 @@ class MHCLite(Module):
         self.add_branch_out_to_residual = add_branch_out_to_residual
 
         if add_branch_out_to_residual:
-            beta_init = torch.ones(num_residual_streams_fracs) * -1.
-            beta_init[init_residual_index] = 1.
+            # H_post = 2*sigmoid(beta). beta = 0 -> H_post = 1 on every stream, i.e. each
+            # stream receives exactly +F (HC Eq.14 B = ones), which is required for
+            # multi-layer vanilla equivalence. 0 is also the max-gradient point of sigmoid.
+            beta_init = torch.zeros(num_residual_streams_fracs)
             self.static_beta = nn.Parameter(beta_init)
 
             # ------ 
@@ -465,8 +492,6 @@ class MHCLite(Module):
         if self.channel_first:
             residuals = rearrange(residuals, 'b ... d -> b d ...')
         residuals = self.merge_fracs(residuals)
-
-        print("branch_input shape:", branch_input.shape)
 
         return branch_input, residuals, dict(beta = beta)
 

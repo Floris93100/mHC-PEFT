@@ -315,12 +315,28 @@ class KromHC(Module):
             if f > 2 and (f, "cpu") not in perm_mats_general:
                 perm_mats_general[(f, "cpu")] = get_all_permutations(f).to("cpu")
         
-        init_alpha0 = torch.ones((num_residual_streams_fracs, num_input_views_fracs)) * -1
-        init_alpha0[init_residual_index, :] = 1.
+        # H_pre read: one-hot selection (HC Eq.14 A_m = e_{k mod n}) via sigmoid. The
+        # off-stream logits are set so sum_s sigmoid(.) = 1 *exactly*
+        # (sigma(sel) + (n-1) * sigma(off) = 1) -> branch_input == x at init, while the
+        # per-layer one-hot pattern is kept to gate the backward gradient and break
+        # stream-permutation symmetry (the symmetry break can only come from H_pre).
+        pre_sel = 8.0
+        _sig_sel = 1.0 / (1.0 + math.exp(-pre_sel))
+        if num_residual_streams > 1:
+            _p_off = (1.0 - _sig_sel) / (num_residual_streams - 1)
+            pre_off = math.log(_p_off / (1.0 - _p_off))
+        else:
+            pre_off = pre_sel
+        init_alpha0 = torch.full((num_residual_streams_fracs, num_input_views_fracs), float(pre_off))
+        init_alpha0[init_residual_index, :] = float(pre_sel)
 
         # H_res parameters for Kronecker structure
         # Initialize to imitate identity (i.e., use the first permutation in each 2x2 factor)
-        init_alpha1 = torch.ones(total_res_coeffs * num_fracs) * -8
+        # Each 2x2 factor is a convex combination of {identity, swap}; putting softmax
+        # mass on the identity perm of every factor makes the Kronecker product ~= I
+        # (HC Eq.14 A_r = I). -12 -> per-factor identity weight ~0.999994, so the full
+        # H_res deviates from I by far less than bf16 ulp.
+        init_alpha1 = torch.ones(total_res_coeffs * num_fracs) * -12.
         # Set first permutation coefficient of each factor to 0 (imitates identity P_0)
         coeff_idx = 0
         for num_perms in self.factor_perms:
@@ -351,8 +367,9 @@ class KromHC(Module):
         self.add_branch_out_to_residual = add_branch_out_to_residual
 
         if add_branch_out_to_residual:
-            beta_init = torch.ones(num_residual_streams_fracs) * -1.
-            beta_init[init_residual_index] = 1.
+            # H_post = 2*sigmoid(beta); beta = 0 -> H_post = 1 on every stream (each stream
+            # gets exactly +F, HC Eq.14 B = ones), required for multi-layer equivalence.
+            beta_init = torch.zeros(num_residual_streams_fracs)
             self.static_beta = nn.Parameter(beta_init)
 
             dynamic_beta_shape = (
