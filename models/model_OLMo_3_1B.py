@@ -1,7 +1,5 @@
-# models/olmo_model.py
-# replaces the normal OLMo3 decoder layers with SHC-wrapped layers
-
-"""OLMo3 SHC wrappers and decoder-layer replacements."""
+# models/model_OLMo_3_1B.py
+""" replaces the normal OLMo3 decoder layers with SHC-wrapped layers """
 
 import torch 
 import torch.nn as nn
@@ -15,7 +13,7 @@ from transformers.models.olmo3.modeling_olmo3 import (
     Olmo3PreTrainedModel,
 )
 
-from models.shc import SHC
+from models.static_mHC import SHC
 
 
 class _OlmoAttentionBranch(nn.Module):

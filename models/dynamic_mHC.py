@@ -1,4 +1,4 @@
-# models/mhc.py
+# models/dynamic_mHC.py
 """ dynamic manifold-constrained hyper-connections """
 
 import torch

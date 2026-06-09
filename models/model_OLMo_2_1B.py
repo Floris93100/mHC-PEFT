@@ -1,8 +1,8 @@
-# models/olmo_model.py
-# replaces the normal OLMo decoder layers with SHC-wrapped layers
-# For the 1B olmo2 model: model_name = "allenai/OLMo-2-1124-1B"
-
-"""OLMo2 SHC wrappers and decoder-layer replacements."""
+# models/model_OLMo_2_1B.py
+"""
+replaces the normal OLMo decoder layers with SHC-wrapped layers;
+for the 1B olmo2 model: model_name = "allenai/OLMo-2-1124-1B"
+"""
 
 import torch
 import torch.nn as nn
@@ -16,9 +16,9 @@ from transformers.models.olmo2.modeling_olmo2 import (
     Olmo2PreTrainedModel,
 )
 
-from models.shc import SHC
-from models.mhc_lite import get_init_and_expand_reduce_stream_functions
-from models.Kromhc import (
+from models.static_mHC import SHC
+from models.mHC_lite import get_init_and_expand_reduce_stream_functions
+from models.KromHC import (
     get_init_and_expand_reduce_stream_functions as kromhc_get_init_and_expand_reduce_stream_functions,
 )
 

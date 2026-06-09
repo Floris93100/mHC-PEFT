@@ -1,4 +1,4 @@
-# shc.py
+# models/static_mHC.py
 """ static manifold-constrained hyper-connections """
 
 import torch

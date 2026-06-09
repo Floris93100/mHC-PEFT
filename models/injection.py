@@ -9,7 +9,7 @@ from models.baselines import (
     apply_layer_tuning,
     apply_vera
 )
-from models.olmo_model2 import olmo_shc, olmo_mhc_lite
+from models.model_OLMo_2_1B import olmo_shc, olmo_mhc_lite
 
 
 
