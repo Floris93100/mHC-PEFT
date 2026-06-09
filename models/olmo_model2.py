@@ -18,6 +18,9 @@ from transformers.models.olmo2.modeling_olmo2 import (
 
 from models.shc import SHC
 from models.mhc_lite import get_init_and_expand_reduce_stream_functions
+from models.Kromhc import (
+    get_init_and_expand_reduce_stream_functions as kromhc_get_init_and_expand_reduce_stream_functions,
+)
 
 
 
@@ -182,7 +185,6 @@ class MHCLiteOlmoDecoderLayer(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         """Run attention and MLP MHCLite branches for a decoder layer."""
-        print("hidden_states shape entering attn_hc:", hidden_states.shape)
         hidden_states = self.attn_hc(
             hidden_states,
             attention_mask=attention_mask,
@@ -492,6 +494,116 @@ class MHCLiteOlmoModel(Olmo2Model):
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
         )
+
+class KromHCOlmoDecoderLayer(nn.Module):
+    """Full OLMo decoder-layer replacement with KromHC-wrapped attention and MLP."""
+
+    def __init__(self, base_layer, hidden_size, num_streams=4, num_fracs=1, layer_index=0):
+        super().__init__()
+        init_hyper_conn, _, _ = kromhc_get_init_and_expand_reduce_stream_functions(
+            num_streams=num_streams,
+            num_fracs=num_fracs,
+            dim=hidden_size,
+            layer_index=layer_index,
+        )
+        self.attn_hc = init_hyper_conn(branch=_OlmoAttentionBranch(base_layer))
+        self.mlp_hc  = init_hyper_conn(branch=_OlmoMLPBranch(base_layer))
+
+    def forward(self, hidden_states, attention_mask=None, position_ids=None,
+                past_key_values=None, use_cache=False, position_embeddings=None, **kwargs):
+        hidden_states = self.attn_hc(
+            hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[0]
+
+        hidden_states = self.mlp_hc(hidden_states)
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[0]
+        return hidden_states
+
+
+class KromHCOlmoModel(Olmo2Model):
+    """OLMo model that carries KromHC streams folded into the batch dim, reduced once at the end."""
+
+    def __init__(self, base_model, hidden_size, num_streams=4, num_fracs=1):
+        super().__init__(base_model.config)
+        self.num_streams = num_streams
+        self.padding_idx = base_model.padding_idx
+        self.vocab_size  = base_model.vocab_size
+        self.embed_tokens = base_model.embed_tokens
+        self.norm         = base_model.norm
+        self.rotary_emb   = base_model.rotary_emb
+
+        _, self.expand_stream, self.reduce_stream = \
+            kromhc_get_init_and_expand_reduce_stream_functions(
+                num_streams=num_streams, num_fracs=num_fracs, dim=hidden_size,
+            )
+
+        self.layers = nn.ModuleList([
+            KromHCOlmoDecoderLayer(
+                base_layer=layer, hidden_size=hidden_size,
+                num_streams=num_streams, num_fracs=num_fracs, layer_index=i,
+            )
+            for i, layer in enumerate(base_model.layers)
+        ])
+
+    def forward(self, input_ids=None, attention_mask=None, position_ids=None,
+                past_key_values=None, inputs_embeds=None, use_cache=None, **kwargs):
+        if (input_ids is None) == (inputs_embeds is None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+            inputs_embeds = inputs_embeds.to(
+                self.layers[0].attn_hc.branch.self_attn.q_proj.weight.dtype
+            )
+
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache(config=self.config)
+
+        if position_ids is None:
+            past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
+            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen
+            position_ids = position_ids.unsqueeze(0)
+
+        causal_mask = create_causal_mask(
+            config=self.config, inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask, past_key_values=past_key_values,
+            position_ids=position_ids,
+        )
+        position_embeddings = self.rotary_emb(inputs_embeds, position_ids=position_ids)
+
+        hidden_states = self.expand_stream(inputs_embeds)   # (B,T,D) -> (B*s,T,D)
+
+        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+            hidden_states = decoder_layer(
+                hidden_states, attention_mask=causal_mask,
+                position_embeddings=position_embeddings, position_ids=position_ids,
+                past_key_values=past_key_values, use_cache=use_cache, **kwargs,
+            )
+
+        hidden_states = self.reduce_stream(hidden_states)   # (B*s,T,D) -> (B,T,D)
+        hidden_states = self.norm(hidden_states)
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states, past_key_values=past_key_values,
+        )
+
+
+def olmo_kromhc(olmo: nn.Module, num_streams: int = 4, num_fracs: int = 1):
+    """Replace olmo.model with a KromHC-based model (no double residual)."""
+    hidden_size = olmo.config.hidden_size
+    olmo.model = KromHCOlmoModel(
+        base_model=olmo.model, hidden_size=hidden_size,
+        num_streams=num_streams, num_fracs=num_fracs,
+    )
+    return olmo
 
 def olmo_shc(
     olmo: nn.Module,
