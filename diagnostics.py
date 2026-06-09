@@ -5,6 +5,8 @@ some quick tests for checking mHC method/models behaviour
 * MODEL-level tests: check whether OLMo
     - outputs the correct shapes
     - has gradients flowing to the trainable parameters
+    - is identity-equivalent to the unwrapped model at init
+    - breaks stream symmetry once training starts (streams diverge)
 
 * MODULE-level tests: check whether mHC
     - exposes diagnostics() getter function
@@ -443,6 +445,256 @@ def check_identity_equivalence_model(
     }
 
 
+def _infer_num_streams(model):
+    """best-effort lookup of the residual-stream count on a wrapped model"""
+    for module in model.modules():
+        for attr in ("num_residual_streams", "num_streams"):
+            value = getattr(module, attr, None)
+            if isinstance(value, int) and value > 1:
+                return value
+    return 1
+
+
+def _get_decoder_layers(model):
+    """locates the decoder-layer ModuleList of a (wrapped) causal lm"""
+    inner = getattr(model, "model", model)
+    layers = getattr(inner, "layers", None)
+    if layers is None:
+        raise RuntimeError(
+            "could not locate decoder layers; expected model.model.layers"
+        )
+    return list(layers)
+
+
+def _streams_from_layer_output(hidden_states, num_streams):
+    """reshapes a captured decoder-layer output to (batch, streams, seq, dim).
+
+    handles both stream layouts used by the wrappers:
+      * (batch, seq, streams, dim)   -> SHC-style explicit stream axis
+      * (batch * streams, seq, dim)  -> mHC-lite / KromHC stream-in-batch fold
+    the batch fold uses einops '(b s)', i.e. streams are the inner/faster index,
+    so a plain reshape on the contiguous tensor recovers (b, s, t, d).
+    """
+    if isinstance(hidden_states, (tuple, list)):
+        hidden_states = hidden_states[0]
+
+    hidden_states = hidden_states.detach()
+
+    if hidden_states.dim() == 4:
+        # (b, t, s, d) -> (b, s, t, d)
+        return hidden_states.permute(0, 2, 1, 3).contiguous()
+
+    if hidden_states.dim() == 3:
+        bs, seq, dim = hidden_states.shape
+        if num_streams <= 1 or bs % num_streams != 0:
+            return None
+        batch = bs // num_streams
+        return hidden_states.reshape(batch, num_streams, seq, dim)
+
+    return None
+
+
+def _pairwise_stream_divergence(streams_bstd):
+    """mean_{s != s'} ||X[s] - X[s']|| / mean_s ||X[s]||, averaged over batch, seq.
+
+    equals 0 when the streams are identical (the identity-init / symmetric state),
+    grows as the streams differentiate.
+    """
+    if streams_bstd is None:
+        return None
+
+    x = streams_bstd.float()
+    _, num_streams, _, _ = x.shape
+    if num_streams < 2:
+        return 0.0
+
+    stream_norms = x.norm(dim = -1)                 # (b, s, t)
+    mean_norm = stream_norms.mean().clamp_min(1e-12)
+
+    total = x.new_zeros(())
+    pairs = 0
+    for i in range(num_streams):
+        for j in range(i + 1, num_streams):
+            total = total + (x[:, i] - x[:, j]).norm(dim = -1).mean()
+            pairs += 1
+
+    return (total / pairs / mean_norm).item()
+
+
+def _routing_spread(model):
+    """spread of per-stream routing coeffs via the diagnostics() interface.
+
+    returns mean over modules of:
+      * beta_std_across_streams : std of H_post over the stream axis (0 at init)
+      * hres_offdiagonal_mass   : mean |H_res - I|              (0 at init)
+    values are None if diagnostics are unavailable for this method/config.
+    """
+    try:
+        modules = get_routing_modules(model)
+    except RuntimeError:
+        return {"beta_std_across_streams": None, "hres_offdiagonal_mass": None}
+
+    beta_vals = []
+    hres_vals = []
+
+    for _, module in modules:
+        state = module.diagnostics()
+
+        h_post = to_float_tensor(state.get("h_post"))
+        if h_post is not None and h_post.shape[-1] > 1:
+            beta_vals.append(h_post.std(dim = -1).mean().item())
+
+        h_res = to_float_tensor(state.get("h_res"))
+        if h_res is not None and h_res.dim() >= 2:
+            n = h_res.shape[-1]
+            eye = torch.eye(n, device = h_res.device, dtype = h_res.dtype)
+            hres_vals.append((h_res - eye).abs().mean().item())
+
+    return {
+        "beta_std_across_streams": (
+            sum(beta_vals) / len(beta_vals) if beta_vals else None
+        ),
+        "hres_offdiagonal_mass": (
+            sum(hres_vals) / len(hres_vals) if hres_vals else None
+        ),
+    }
+
+
+def _measure_stream_state(model, batch, num_streams):
+    """one eval forward: per-layer stream divergence + routing-coefficient spread"""
+    layers = _get_decoder_layers(model)
+    captured = {}
+
+    def make_hook(index):
+        def hook(_module, _inputs, output):
+            captured[index] = output
+        return hook
+
+    handles = [
+        layer.register_forward_hook(make_hook(i))
+        for i, layer in enumerate(layers)
+    ]
+
+    was_training = model.training
+    model.eval()
+
+    spread = {"beta_std_across_streams": None, "hres_offdiagonal_mass": None}
+    try:
+        try:                            # diagnostics on -> also get routing spread
+            set_module_diagnostics(model, True)
+            with torch.no_grad():
+                model(**batch)
+            spread = _routing_spread(model)
+        except Exception:               # method/config without diagnostics: hooks only
+            captured.clear()
+            set_module_diagnostics(model, False)
+            with torch.no_grad():
+                model(**batch)
+    finally:
+        set_module_diagnostics(model, False)
+        for handle in handles:
+            handle.remove()
+        if was_training:
+            model.train()
+
+    per_layer = []
+    for index in sorted(captured):
+        divergence = _pairwise_stream_divergence(
+            _streams_from_layer_output(captured[index], num_streams)
+        )
+        if divergence is not None:
+            per_layer.append(divergence)
+
+    result = {
+        "mean_stream_divergence": (
+            sum(per_layer) / len(per_layer) if per_layer else None
+        ),
+        "max_stream_divergence": max(per_layer) if per_layer else None,
+        "per_layer_stream_divergence": per_layer,
+    }
+    result.update(spread)
+    return result
+
+
+def check_stream_divergence(
+    model,
+    tokenizer,
+    batch_size = 1,
+    seq_len = 32,
+    num_steps = 50,
+    lr = 1e-3,
+    checkpoints = (0, 1, 5, 10, 25, 50),
+    seed = 0,
+):
+    """model-level dynamics test: do the n residual streams diverge during training?
+
+    At an identity-equivalent init every stream holds the same vector, so the
+    pairwise stream divergence is ~0. The symmetry break (so n>1 streams can
+    specialise) is seeded by the per-layer one-hot H_pre, which gates the backward
+    gradient to a different stream in each layer. This runs a short overfitting
+    loop on a single tiny batch and records the divergence trajectory, plus the
+    spread of the per-stream H_post (beta) and the off-identity mass of H_res.
+
+    It reports symmetry_broke = (divergence grew) but does NOT assert it: symmetry
+    breaking on a synthetic batch in a few steps is empirical, not a correctness
+    guarantee. This MUTATES the passed model (it trains it), so run it last.
+    """
+    torch.manual_seed(seed)
+
+    num_streams = _infer_num_streams(model)
+    if num_streams < 2:
+        return {
+            "passed": True,
+            "skipped": "num_streams < 2 (single stream, nothing to diverge)",
+        }
+
+    batch = make_tiny_batch(tokenizer, model, batch_size, seq_len)
+    labels = batch["input_ids"].clone()
+    labels[batch["attention_mask"] == 0] = -100
+
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    assert trainable, "no trainable parameters; cannot probe training dynamics"
+    optimizer = torch.optim.AdamW(trainable, lr = lr)
+
+    checkpoints = sorted({c for c in checkpoints if 0 <= c <= num_steps})
+    trajectory = {}
+
+    if 0 in checkpoints:
+        trajectory[0] = _measure_stream_state(model, batch, num_streams)
+
+    for step in range(1, num_steps + 1):
+        model.train()
+        model.zero_grad(set_to_none = True)
+        outputs = model(
+            input_ids = batch["input_ids"],
+            attention_mask = batch["attention_mask"],
+            labels = labels,
+        )
+        loss = outputs.loss
+        assert torch.isfinite(loss), f"loss became non-finite at step {step}"
+        loss.backward()
+        optimizer.step()
+
+        if step in checkpoints:
+            trajectory[step] = _measure_stream_state(model, batch, num_streams)
+
+    ordered = sorted(trajectory)
+    first = trajectory[ordered[0]].get("mean_stream_divergence") or 0.0
+    last = trajectory[ordered[-1]].get("mean_stream_divergence") or 0.0
+
+    return {
+        "passed": True,
+        "num_streams": num_streams,
+        "num_steps": num_steps,
+        "lr": lr,
+        "symmetry_broke": bool(last > first + 1e-4),
+        "initial_mean_divergence": first,
+        "final_mean_divergence": last,
+        "divergence_growth": last - first,
+        "trajectory": {str(step): trajectory[step] for step in ordered},
+    }
+
+
 def check_mhc(
     cfg,
     batch_size = 1,
@@ -452,6 +704,9 @@ def check_mhc(
     identity_atol = 1e-4,
     identity_rtol = 1e-4,
     skip_module_tests = False,
+    run_divergence = True,
+    divergence_steps = 50,
+    divergence_lr = 1e-3,
 ):
     """runs all quick diagnostics"""
     cfg.model.use_cache = False
@@ -501,6 +756,16 @@ def check_mhc(
             rtol = identity_rtol,
         )
 
+    if run_divergence:
+        results["stream_divergence"] = check_stream_divergence(
+            model = model,
+            tokenizer = tokenizer,
+            batch_size = batch_size,
+            seq_len = seq_len,
+            num_steps = divergence_steps,
+            lr = divergence_lr,
+        )
+
     return results
 
 
@@ -514,6 +779,11 @@ def main():
                                         # for debugging, identity test can be switched off
     parser.add_argument("--skip_identity", action = "store_true")
     parser.add_argument("--skip_module_tests", action = "store_true")
+                                        # stream-divergence dynamics probe (trains
+                                        # the model on one tiny batch); off via flag
+    parser.add_argument("--skip_divergence", action = "store_true")
+    parser.add_argument("--divergence_steps", type = int, default = 50)
+    parser.add_argument("--divergence_lr", type = float, default = 1e-3)
     parser.add_argument("--identity_atol", type = float, default = 1e-2)
     parser.add_argument("--identity_rtol", type = float, default = 1e-2)
 
@@ -532,6 +802,9 @@ def main():
         identity_atol = args.identity_atol,
         identity_rtol = args.identity_rtol,
         skip_module_tests = args.skip_module_tests,
+        run_divergence = not args.skip_divergence,
+        divergence_steps = args.divergence_steps,
+        divergence_lr = args.divergence_lr,
     )
 
     print(json.dumps(results, indent = 2))
