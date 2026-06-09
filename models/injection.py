@@ -9,7 +9,8 @@ from models.baselines import (
     apply_layer_tuning,
     apply_vera
 )
-from models.olmo_model2 import olmo_shc
+from models.olmo_model2 import olmo_shc, olmo_mhc_lite
+
 
 
 def freeze_base_model(model):
@@ -33,6 +34,17 @@ def inject_hyperconnections(model, method_cfg):
         dropout_stream = method_cfg.shc_dropout_stream,
         softmax_readout = getattr(method_cfg, "shc_softmax_readout", False),
     )
+
+#ADDED
+def inject_mhc_lite(model, method_cfg): 
+    device = next(model.parameters()).device
+    freeze_base_model(model)
+    return olmo_mhc_lite(model, 
+                         num_streams=method_cfg.shc_num_streams,
+                         num_fracs=method_cfg.mhc_num_fracs,
+                         ablate_mapping = method_cfg.shc_ablation_mapping
+                         ).to(device)
+
 
 def shc_lora(model, method_cfg): 
     """Inject SHC then apply LoRA, enabling non-ablated SHC logits."""
@@ -107,7 +119,7 @@ def inject_layer_tuning(model, method_cfg):
 
     return model
 
-
+#ADD MHC LITE 
 def inject_method(model, cfg):
     """ applies selected finetuning method (cfg) to given model """
     method_name = cfg.method.selected_method.lower()
@@ -133,6 +145,8 @@ def inject_method(model, cfg):
         return shc_lora(model, cfg.method)
     if method_name == "shc_vera":
         return shc_vera(model, cfg.method)
+    if method_name == "mhc_lite": 
+        return inject_mhc_lite(model, cfg.method)
     if method_name == "mhc":
         raise NotImplementedError("method.selected_method = mhc is not implemented yet")
 

@@ -25,7 +25,7 @@ class DualLRTrainer(Trainer):
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
                 continue
-            if name.endswith(("pre_logits", "post_logits", "res_logits")):
+            if any(x in name for x in ("attn_hc", "mlp_hc")):
                 shc_params.append(param)
             else:
                 lora_params.append(param)
@@ -160,6 +160,7 @@ def save_reload_metadata(experiment_cfg, output_dir):
         "shc_noise_std" : experiment_cfg.method.shc_noise_std,
         "shc_ablation_mapping" : experiment_cfg.method.shc_ablation_mapping,
         "shc_softmax_readout" : experiment_cfg.method.shc_softmax_readout,
+        "mhc_num_fracs" : experiment_cfg.method.mhc_num_fracs,
         "peft_lora_rank" : experiment_cfg.method.peft_lora_rank,
         "peft_lora_alpha" : experiment_cfg.method.peft_lora_alpha,
         "peft_lora_dropout" : experiment_cfg.method.peft_lora_dropout,
@@ -232,7 +233,7 @@ def train_model(model, tokenizer, train_dataset, cfg, experiment_cfg, eval_datas
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
-            is_shc = name.endswith(("pre_logits", "post_logits", "res_logits"))
+            is_shc = any(x in name for x in ("attn_hc", "mlp_hc"))
             print(f"  {'SHC ' if is_shc else 'LoRA'} | lr={'shc_lr' if is_shc else 'lora_lr'} | {name}")
         print(f"  shc_lr  = {cfg.shc_learning_rate}")
         print(f"  lora_lr = {cfg.lora_learning_rate}")
@@ -273,6 +274,7 @@ def train_model(model, tokenizer, train_dataset, cfg, experiment_cfg, eval_datas
     save_reload_metadata(
         experiment_cfg,
         cfg.final_trainable_params_dir,
+
     )
     save_training_summary(
         model,

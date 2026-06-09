@@ -26,6 +26,8 @@ method:
   shc_ablation_mapping: []              # for ablations to test impact of each mapping, either null, pre, res or post 
   shc_softmax_readout: false            # if true, learn softmax weights for final stream readout
 
+  mhc_num_fracs: 1                   #in standard implementation this is set to 1, in paper they vary this fraction splitting
+
   peft_lora_rank: 8                     # LoRA/DoRA low-rank dimension
   peft_lora_alpha: 16                   # LoRA/DoRA update scaling
   peft_lora_dropout: 0.05               # Dropout inside LoRA/DoRA adapters
