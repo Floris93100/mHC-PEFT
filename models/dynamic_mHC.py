@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from random import randrange
 
 class RMSNorm(nn.Module):
     """ root-mean-square normalization layer """
@@ -75,6 +76,7 @@ class MHC(nn.Module):
         eps: float = 1e-6,
         init_std: float = 1e-3,
         train_branch: bool = False,
+        layer_index: int | None = None, 
     ):
         """ initialize the MHC wrapper and projection parameters """
         super().__init__()
@@ -85,6 +87,7 @@ class MHC(nn.Module):
         self.eps = eps
         # small init std to break symmetry
         self.init_std = init_std
+        self.init_idx = randrange(num_streams) if layer_index is None else layer_index % num_streams
 
         flat_dim = num_streams * hidden_size
 
@@ -119,23 +122,40 @@ class MHC(nn.Module):
         nn.init.normal_(self.post_proj.weight, mean = 0.0, std = self.init_std)
         nn.init.normal_(self.res_proj.weight, mean = 0.0, std = self.init_std)
 
+        # OLD VERSION
         # initialise H_pre so that H_pre[i] is 1/n
         # p = 1/n
-        pre_target = 1.0 / self.num_streams
+        #pre_target = 1.0 / self.num_streams
         # bias = log(p/(1-p)) , so sigmoid(bias) = 1/n
-        pre_bias = math.log(pre_target / (1.0 - pre_target))
-        nn.init.constant_(self.pre_proj.bias, pre_bias)
+        #pre_bias = math.log(pre_target / (1.0 - pre_target))
+        #nn.init.constant_(self.pre_proj.bias, pre_bias)
 
+        # NEW VERSION with one-hot symmetry breaking
+         # H_pre: one-hot symmetry-breaking (KromHC / mHC-lite style)
+        # stream init_idx gets logit +8 (σ ≈ 1); others get pre_off such that σ(+8) + (n-1)·σ(pre_off) ≈ 1  (convex combination at init)
+        pre_sel = 8.0
+        sig_sel = 1.0 / (1.0 + math.exp(-pre_sel))
+        if self.num_streams > 1:
+            p_off   = (1.0 - sig_sel) / (self.num_streams - 1)
+            pre_off = math.log(p_off / (1.0 - p_off))
+        else:
+            pre_off = pre_sel
+        nn.init.constant_(self.pre_proj.bias, pre_off)
+        self.pre_proj.bias.data[self.init_idx] = pre_sel
+ 
+    
         # H_post[i] = 2 * sigmoid(0) = 1 so that branch output is initially unscaled
         nn.init.zeros_(self.post_proj.bias)
 
         # zero bias for res_proj so doubly stochastic matrix starts approximately uniform
         nn.init.zeros_(self.res_proj.bias)
+        for i in range(self.num_streams):
+            self.res_proj.bias.data[i * self.num_streams + i] = 8.0
 
-        # alpha starts at 1 so that initial H_pre, H_post, H_res are near uniform
-        nn.init.ones_(self.alpha_pre)
-        nn.init.ones_(self.alpha_post)
-        nn.init.ones_(self.alpha_res)
+        # small scale so dynamic part starts near zero; static bias dominates at init, match mhc_lite
+        nn.init.constant_(self.alpha_pre,  1e-2)
+        nn.init.constant_(self.alpha_post, 1e-2)
+        nn.init.constant_(self.alpha_res,  1e-2)
 
         # RMSNorm scale starts neutral
         nn.init.ones_(self.norm.weight)

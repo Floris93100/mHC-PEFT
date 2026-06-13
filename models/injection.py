@@ -9,7 +9,8 @@ from models.baselines import (
     apply_layer_tuning,
     apply_vera
 )
-from models.model_OLMo_2_1B import olmo_shc, olmo_mhc_lite, olmo_kromhc
+from models.model_OLMo_2_1B import olmo_shc, olmo_mhc_lite, olmo_kromhc, olmo_mhc
+
 
 
 
@@ -35,7 +36,17 @@ def inject_hyperconnections(model, method_cfg):
         softmax_readout = getattr(method_cfg, "shc_softmax_readout", False),
     )
 
-#ADDED
+
+def inject_mhc(model, method_cfg):
+    device = next(model.parameters()).device
+    freeze_base_model(model)
+    return olmo_mhc(
+        model,
+        num_streams=method_cfg.shc_num_streams,
+        sinkhorn_iters=method_cfg.shc_sinkhorn_iterations,
+        eps=method_cfg.shc_sinkhorn_epsilon,
+    ).to(device)
+
 def inject_mhc_lite(model, method_cfg): 
     device = next(model.parameters()).device
     freeze_base_model(model)
@@ -159,7 +170,7 @@ def inject_method(model, cfg):
     if method_name == "kromhc":
         return inject_kromHC(model, cfg.method)
     if method_name == "mhc":
-        raise NotImplementedError("method.selected_method = mhc is not implemented yet")
+        return inject_mhc(model, cfg.method)
 
     raise ValueError(f"unknown method: {cfg.method.selected_method}")
 
