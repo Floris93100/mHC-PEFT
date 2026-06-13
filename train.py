@@ -9,6 +9,8 @@ from transformers import Trainer, TrainingArguments, DataCollatorForLanguageMode
 
 from models.injection import count_trainable_parameters
 
+from callbacks import WeightGradStatsCallback
+
 class DualLRTrainer(Trainer):
     """Trainer with separate learning rates for SHC and PEFT params."""
     def __init__(self, *args, shc_lr, lora_lr, **kwargs):
@@ -247,6 +249,7 @@ def train_model(model, tokenizer, train_dataset, cfg, experiment_cfg, eval_datas
             processing_class=tokenizer,
             shc_lr=cfg.shc_learning_rate,
             lora_lr=cfg.lora_learning_rate,
+            callbacks=[WeightGradStatsCallback(model)]
             )
     else: 
         trainer = Trainer(
@@ -256,6 +259,7 @@ def train_model(model, tokenizer, train_dataset, cfg, experiment_cfg, eval_datas
             eval_dataset = eval_dataset,
             data_collator = collator,
             processing_class = tokenizer,
+            callbacks=[WeightGradStatsCallback(model)],
         )
 
     train_output = trainer.train(       # possibly resume from checkpoint
