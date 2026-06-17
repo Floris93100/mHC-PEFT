@@ -63,6 +63,7 @@ def build_reload_cfg(metadata):
             "shc_noise_std" : metadata.get("shc_noise_std", 1e-2),
             "shc_ablation_mapping" : metadata.get("shc_ablation_mapping", []),
             "shc_softmax_readout" : metadata.get("shc_softmax_readout", False),
+            "mhc_num_fracs" : metadata.get("mhc_num_fracs", 1),
 
             "peft_lora_rank" : metadata.get("peft_lora_rank", 8),
             "peft_lora_alpha" : metadata.get("peft_lora_alpha", 16),

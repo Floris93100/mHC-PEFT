@@ -68,7 +68,7 @@ def load_base_model_and_tokenizer(model_name):
 
 def load_eval_model(model_name, checkpoint_dir):
     if checkpoint_dir is not None:
-        model, tokenizer, reload_cfg = load_finetuned_model(checkpoint_dir)
+        model, tokenizer, reload_cfg = load_finetuned_model(checkpoint_dir + "/final_model")
 
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
