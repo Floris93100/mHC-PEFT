@@ -48,7 +48,8 @@ class MHC(nn.Module):
     """
     mHC wrapper based on the DeepSeek manifold Hyperconnections paper
 
-    Maintains n parallel streams of shape (B, T, n, D). On each forward pass:
+    Maintains n parallel streams of shape (B, T, n, D). 
+    On each forward pass:
 
     1. Flatten & RMSNorm the stream tensor → (B, T, n*D)
     2. Project into three learned mappings (all scaled by a learned temperature α):
@@ -61,11 +62,10 @@ class MHC(nn.Module):
           X_new = H_res @ X          # route residuals across streams
                 + H_post · branch_out # inject scaled sub-layer output
 
-    6. Return stream 0 (or mean/sum? of streams) as y, shape (B, T, D).
+    6. Return the updated stream tensor X_new of shape (B, T, n, D). Readout
+       to (B, T, D) happens once, at the model level, after the final layer.
 
     The Sinkhorn operator iteratively normalises rows then columns (t_max=20 iters).
-    Output type signature matches the wrapped sub-layer for drop-in compatibility.
-    
     """
     def __init__(
         self,
@@ -117,22 +117,21 @@ class MHC(nn.Module):
 
     def reset_parameters(self):
         """ initialize projection weights and gating parameters """
-        # tiny noise to break symmetry on weights
-        nn.init.normal_(self.pre_proj.weight, mean = 0.0, std = self.init_std)
-        nn.init.normal_(self.post_proj.weight, mean = 0.0, std = self.init_std)
-        nn.init.normal_(self.res_proj.weight, mean = 0.0, std = self.init_std)
+        # Zero-init the dynamic projection weights so each gate equals exactly
+        # its static bias value at init -- no input-dependent wobble, giving a
+        # bit-exact identity at step 0 (matching the KromHC zero-init of its
+        # dynamic_alpha_fn / dynamic_beta_fn). Stream symmetry is broken by the
+        # per-layer one-hot bias on pre_proj below, not by weight noise, so the
+        # previous N(0, init_std) weight noise was unnecessary and only worked
+        # against an exact identity at initialization.
+        nn.init.zeros_(self.pre_proj.weight)
+        nn.init.zeros_(self.post_proj.weight)
+        nn.init.zeros_(self.res_proj.weight)
 
-        # OLD VERSION
-        # initialise H_pre so that H_pre[i] is 1/n
-        # p = 1/n
-        #pre_target = 1.0 / self.num_streams
-        # bias = log(p/(1-p)) , so sigmoid(bias) = 1/n
-        #pre_bias = math.log(pre_target / (1.0 - pre_target))
-        #nn.init.constant_(self.pre_proj.bias, pre_bias)
-
-        # NEW VERSION with one-hot symmetry breaking
-         # H_pre: one-hot symmetry-breaking (KromHC / mHC-lite style)
-        # stream init_idx gets logit +8 (σ ≈ 1); others get pre_off such that σ(+8) + (n-1)·σ(pre_off) ≈ 1  (convex combination at init)
+        # H_pre: one-hot symmetry-breaking (KromHC / mHC-lite style)
+        # stream init_idx gets logit +8 (σ ≈ 1); others get pre_off such that
+        # σ(+8) + (n-1)·σ(pre_off) ≈ 1  (convex combination at init), so the
+        # gated branch input equals x at init.
         pre_sel = 8.0
         sig_sel = 1.0 / (1.0 + math.exp(-pre_sel))
         if self.num_streams > 1:
@@ -142,12 +141,15 @@ class MHC(nn.Module):
             pre_off = pre_sel
         nn.init.constant_(self.pre_proj.bias, pre_off)
         self.pre_proj.bias.data[self.init_idx] = pre_sel
- 
-    
+
         # H_post[i] = 2 * sigmoid(0) = 1 so that branch output is initially unscaled
         nn.init.zeros_(self.post_proj.bias)
 
-        # zero bias for res_proj so doubly stochastic matrix starts approximately uniform
+        # diagonal-dominant bias for res_proj so the doubly-stochastic matrix
+        # starts approximately identity (Sinkhorn of a strongly diagonal logit
+        # matrix ≈ I). With persistent streams this now actually matters: at
+        # init H_res ≈ I keeps the streams from mixing, so all streams stay
+        # equal across depth and reproduce the vanilla residual recurrence.
         nn.init.zeros_(self.res_proj.bias)
         for i in range(self.num_streams):
             self.res_proj.bias.data[i * self.num_streams + i] = 8.0
@@ -159,12 +161,6 @@ class MHC(nn.Module):
 
         # RMSNorm scale starts neutral
         nn.init.ones_(self.norm.weight)
-
-    # initialize streams with copies of the input
-    def _init_streams(self, x):
-        """ initialize stream tensor by copying inputs across streams """
-        X = x.unsqueeze(2).repeat(1, 1, self.num_streams, 1)
-        return X
 
     @staticmethod
     def _extract_hidden(out):
@@ -198,13 +194,19 @@ class MHC(nn.Module):
             "h_post": self._last_h_post,
         }
 
-    def forward(self, x, *args, **kwargs):
-        """ run the wrapped branch and update hyperconnection streams """
-        # x: (B,T,D)
-        X = self._init_streams(x)                          # (B,T,n,D)
+    def forward(self, X, *args, **kwargs):
+        """ run the wrapped branch and update hyperconnection streams.
+
+        X is the persistent stream tensor of shape (B, T, n, D), created once
+        at the model level and threaded through every MHC layer. This module
+        no longer fabricates and collapses its own per-call copy of the
+        streams (see class docstring for why that made H_res inert).
+        Returns the updated stream tensor X_new of shape (B, T, n, D).
+        """
+        # X: (B,T,n,D)
+        B, T, n, D = X.shape
 
         # flatten streams into feature vector, normalize
-        B, T, n, D = X.shape
         flat = X.reshape(B, T, n * D)
         h = self.norm(flat)
 
@@ -245,9 +247,8 @@ class MHC(nn.Module):
         X_new = X_res + X_post
         X_new = X_new.to(dtype = X.dtype)
 
-        y = X_new.mean(dim=2)
-        
-        # safety for huggingface compatibility
+        # return the full stream tensor; readout to (B,T,D) happens once at
+        # the model level, not after every layer
         if isinstance(branch_out_raw, tuple):
-            return (y,) + branch_out_raw[1:]
-        return y
+            return (X_new,) + branch_out_raw[1:]
+        return X_new

@@ -147,7 +147,13 @@ class SHCOlmoDecoderLayer(nn.Module):
         return hidden_states
     
 class MHCOlmoDecoderLayer(nn.Module):
-    """Full OLMo decoder-layer replacement with dynamic MHC-wrapped attention and MLP."""
+    """Full OLMo decoder-layer replacement with dynamic MHC-wrapped attention and MLP.
+
+    Operates on the persistent stream tensor (B,T,n,D): it receives streams,
+    passes them through the attention MHC and then the MLP MHC, and returns
+    the updated streams. Expansion to streams and reduction back to (B,T,D)
+    are handled once at the model level (MHCOlmoModel), mirroring SHCOlmoModel.
+    """
 
     def __init__(
         self,
@@ -444,12 +450,19 @@ class SHCOlmoModel(Olmo2Model):
 
 
 class MHCOlmoModel(Olmo2Model):
-    """OLMo model with dynamic MHC decoder layers. MHC handles streams
-    internally per layer, so no expand/reduce is needed at the model level."""
+    """OLMo model with dynamic MHC decoder layers.
+
+    Streams persist across depth and are expanded/reduced once here at the
+    model level, mirroring SHCOlmoModel. The per-layer MHC modules operate on
+    the (B,T,n,D) stream tensor and no longer fabricate or collapse their own
+    per-call copy of the streams -- that previous behaviour made H_res
+    mathematically inert (H_res @ X == X whenever all streams of X are equal,
+    which they always were when each layer re-created identical streams)."""
 
     def __init__(self, base_model, hidden_size, num_streams=4,
                  sinkhorn_iters=20, eps=1e-6, train_branch=False):
         super().__init__(base_model.config)
+        self.num_streams  = num_streams
         self.padding_idx  = base_model.padding_idx
         self.vocab_size   = base_model.vocab_size
         self.embed_tokens = base_model.embed_tokens
@@ -468,6 +481,15 @@ class MHCOlmoModel(Olmo2Model):
             )
             for i, layer in enumerate(base_model.layers)
         ])
+
+    def _init_streams(self, x: torch.Tensor) -> torch.Tensor:
+        """Initialize stream tensor by copying inputs across streams."""
+        # [b, t, h] -> [b, t, s, h]
+        return x.unsqueeze(2).repeat(1, 1, self.num_streams, 1)
+
+    def _readout(self, streams: torch.Tensor) -> torch.Tensor:
+        """Collapse the stream dimension via mean."""
+        return streams.mean(dim=2)
 
     def forward(self, input_ids=None, attention_mask=None, position_ids=None,
                 past_key_values=None, inputs_embeds=None, use_cache=None, **kwargs):
@@ -497,7 +519,8 @@ class MHCOlmoModel(Olmo2Model):
         )
         position_embeddings = self.rotary_emb(inputs_embeds, position_ids=position_ids)
 
-        hidden_states = inputs_embeds
+        # expand: (B,T,D) -> (B,T,n,D); streams persist across all layers
+        hidden_states = self._init_streams(inputs_embeds)
 
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
             hidden_states = decoder_layer(
@@ -510,6 +533,8 @@ class MHCOlmoModel(Olmo2Model):
                 **kwargs,
             )
 
+        # reduce: (B,T,n,D) -> (B,T,D), then norm
+        hidden_states = self._readout(hidden_states)
         hidden_states = self.norm(hidden_states)
 
         return BaseModelOutputWithPast(
@@ -814,7 +839,3 @@ def olmo_kromhc(
         num_streams=num_streams, num_fracs=num_fracs,
     )
     return olmo
-
-
-
-

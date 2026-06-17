@@ -48,12 +48,12 @@ class WeightGradStatsCallback(TrainerCallback):
                 continue
             w = param.detach().float()
             self._writer.add_scalar(f"weights/{name}/mean", w.mean(), step)
-            self._writer.add_scalar(f"weights/{name}/std",  w.std(),  step)
+            self._writer.add_scalar(f"weights/{name}/std",  w.std(correction=0),  step)
             self._writer.add_scalar(f"weights/{name}/min",  w.min(),  step)
             self._writer.add_scalar(f"weights/{name}/max",  w.max(),  step)
 
         for name, grad in self._grad_stats.items():
             self._writer.add_scalar(f"gradients/{name}/mean", grad.mean(), step)
-            self._writer.add_scalar(f"gradients/{name}/std",  grad.std(),  step)
+            self._writer.add_scalar(f"gradients/{name}/std",  grad.std(correction=0),  step)
             self._writer.add_scalar(f"gradients/{name}/min",  grad.min(),  step)
             self._writer.add_scalar(f"gradients/{name}/max",  grad.max(),  step)
