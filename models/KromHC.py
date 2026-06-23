@@ -264,10 +264,28 @@ class KromHC(Module):
         num_input_views = 1,
         depth_residual_fn = add,
         num_fracs = 1,
+        ablate_mapping = None,
     ):
         super().__init__()
 
         #### We assume num_fracs = 1, num_input_views = 1 ###
+
+        # ablations
+        #   "pre"  -> H_pre  = uniform weights of 1/n   
+        #   "post" -> H_post = uniform weights of ones  
+        #   "res"  -> H_res  = the identity matrix      
+        if ablate_mapping is None:
+            ablate_mapping = []
+        elif isinstance(ablate_mapping, str):
+            ablate_mapping = [ablate_mapping]
+        ablate_set = {str(m).lower() for m in ablate_mapping}
+
+        unknown = ablate_set - {"pre", "post", "res"}
+        assert not unknown, f"unknown ablation target(s) {unknown}; expected any of 'pre', 'post', 'res'"
+
+        self.ablate_pre = "pre" in ablate_set
+        self.ablate_post = "post" in ablate_set
+        self.ablate_res = "res" in ablate_set
 
         self.branch = branch
         assert num_fracs >= 1
@@ -542,12 +560,20 @@ class KromHC(Module):
 
         device = combined_weight.device
         
-        alpha_residual = self._build_kronecker_hres(dynamic_residual, static_residual, device)
+        if self.ablate_res:
+            n = streams
+            eye = torch.eye(n, device=device, dtype=self.static_alpha.dtype)
+            alpha_residual = eye.expand(*dynamic_residual.shape[:-1], n, n)
+        else:
+            alpha_residual = self._build_kronecker_hres(dynamic_residual, static_residual, device)
         alpha_residual = self.split_fracs(alpha_residual)
 
         alpha_pre = self.pre_branch_scale * dynamic_pre + static_pre
         alpha_pre = rearrange(alpha_pre, '... (f s v) -> ... s f v', v=self.num_input_views, f=self.num_fracs)
         alpha_pre = alpha_pre.sigmoid()
+
+        if self.ablate_pre:
+            alpha_pre = torch.full_like(alpha_pre, 1.0 / self.num_residual_streams)
 
         alpha = cat((alpha_pre, alpha_residual), dim=-1)  # (..., f, s, f, v+s)
 
@@ -562,6 +588,9 @@ class KromHC(Module):
 
             beta = dynamic_beta + static_beta
             beta = beta.sigmoid() * 2  # sigmoid * 2 for "H_post"
+
+            if self.ablate_post:
+                beta = torch.ones_like(beta)
 
         if self.diagnostics_enabled:    # for diagnostics() getter function
             if self.num_fracs != 1:
