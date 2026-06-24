@@ -64,6 +64,8 @@ def build_reload_cfg(metadata):
             "shc_ablation_mapping" : metadata.get("shc_ablation_mapping", []),
             "shc_softmax_readout" : metadata.get("shc_softmax_readout", False),
             "mhc_num_fracs" : metadata.get("mhc_num_fracs", 1),
+            "mhc_init_hres" : metadata.get("mhc_init_hres", "identity"),
+            "mhc_hres_init_noise_std" : metadata.get("mhc_hres_init_noise_std", 0.0),
 
             "peft_lora_rank" : metadata.get("peft_lora_rank", 8),
             "peft_lora_alpha" : metadata.get("peft_lora_alpha", 16),
@@ -74,10 +76,8 @@ def build_reload_cfg(metadata):
             "peft_bias" : metadata.get("peft_bias", "none"),
             "peft_target_modules" : metadata.get("peft_target_modules", ["all-linear"]),
             
-            # FIX 1: Ensure it defaults gracefully but respects the saved metadata list
             "peft_target_modules" : metadata.get("peft_target_modules", ["q_proj", "v_proj"]),
             
-            # FIX 2: Add the missing IA3 feedforward modules key
             "peft_feedforward_modules" : metadata.get("peft_feedforward_modules", ["up_proj", "down_proj", "gate_proj"]),
 
             "prompt_tuning_num_virtual_tokens" : metadata.get("prompt_tuning_num_virtual_tokens", 20),

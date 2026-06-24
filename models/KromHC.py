@@ -265,6 +265,8 @@ class KromHC(Module):
         depth_residual_fn = add,
         num_fracs = 1,
         ablate_mapping = None,
+        hres_init = "identity",
+        hres_init_noise_std = 0.0,
     ):
         super().__init__()
 
@@ -286,6 +288,12 @@ class KromHC(Module):
         self.ablate_pre = "pre" in ablate_set
         self.ablate_post = "post" in ablate_set
         self.ablate_res = "res" in ablate_set
+
+        assert hres_init in ("identity", "uniform", "permutation"), \
+            f"unknown hres_init {hres_init!r}; expected 'identity', 'uniform', or 'permutation'"
+        assert hres_init_noise_std >= 0.0, "hres_init_noise_std must be non-negative"
+        self.hres_init = hres_init
+        self.hres_init_noise_std = float(hres_init_noise_std)
 
         self.branch = branch
         assert num_fracs >= 1
@@ -348,18 +356,34 @@ class KromHC(Module):
         init_alpha0 = torch.full((num_residual_streams_fracs, num_input_views_fracs), float(pre_off))
         init_alpha0[init_residual_index, :] = float(pre_sel)
 
-        # H_res parameters for Kronecker structure
-        # Initialize to imitate identity (i.e., use the first permutation in each 2x2 factor)
-        # Each 2x2 factor is a convex combination of {identity, swap}; putting softmax
-        # mass on the identity perm of every factor makes the Kronecker product ~= I
-        # (HC Eq.14 A_r = I). -12 -> per-factor identity weight ~0.999994, so the full
-        # H_res deviates from I by far less than bf16 ulp.
-        init_alpha1 = torch.ones(total_res_coeffs * num_fracs) * -12.
-        # Set first permutation coefficient of each factor to 0 (imitates identity P_0)
-        coeff_idx = 0
-        for num_perms in self.factor_perms:
-            init_alpha1[coeff_idx] = 0.  # Imitates first perm of this factor → identity
-            coeff_idx += num_perms
+        HIGH, LOW = 0.0, -12.
+        init_alpha1 = torch.full((total_res_coeffs * num_fracs,), float(LOW))
+        if self.hres_init == "uniform":
+            init_alpha1.fill_(0.)  # equal logits on every perm -> uniform doubly-stochastic
+        elif self.hres_init_noise_std <= 0.0:
+            # exact vertex: HIGH on the selected perm, LOW (~hard zero) on the rest
+            coeff_idx = 0
+            for num_perms in self.factor_perms:
+                sel = 0 if self.hres_init == "identity" else (num_perms - 1)
+                init_alpha1[coeff_idx + sel] = float(HIGH)
+                coeff_idx += num_perms
+        else:
+            init_alpha1 = init_alpha1.view(num_fracs, total_res_coeffs).clone()
+            for f in range(num_fracs):
+                coeff_idx = 0
+                for num_perms in self.factor_perms:
+                    sel = 0 if self.hres_init == "identity" else (num_perms - 1)
+                    off = (torch.randn(num_perms) * self.hres_init_noise_std).abs()
+                    off[sel] = 0.0
+                    # keep the chosen perm dominant: cap total leaked mass at 0.9
+                    cap = 0.9 / max(num_perms - 1, 1)
+                    off = off.clamp(max=cap)
+                    probs = off.clone()
+                    probs[sel] = 1.0 - off.sum()
+                    probs = probs.clamp_min(math.exp(LOW))
+                    init_alpha1[f, coeff_idx:coeff_idx + num_perms] = torch.log(probs)
+                    coeff_idx += num_perms
+            init_alpha1 = init_alpha1.view(-1)
 
         # Combined static alpha
         self.static_alpha = nn.Parameter(cat([
