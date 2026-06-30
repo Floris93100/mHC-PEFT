@@ -62,7 +62,9 @@ def inject_kromHC(model, method_cfg):
     return olmo_kromhc(model, 
             num_streams=method_cfg.shc_num_streams,
             num_fracs=method_cfg.mhc_num_fracs,
-            ablate_mapping = method_cfg.shc_ablation_mapping
+            ablate_mapping = method_cfg.shc_ablation_mapping,
+            hres_init=method_cfg.mhc_init_hres,
+            hres_init_noise_std=method_cfg.mhc_hres_init_noise_std,
         ).to(device)
 
 

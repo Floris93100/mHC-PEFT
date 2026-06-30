@@ -654,13 +654,17 @@ class MHCLiteOlmoModel(Olmo2Model):
 class KromHCOlmoDecoderLayer(nn.Module):
     """Full OLMo decoder-layer replacement with KromHC-wrapped attention and MLP."""
 
-    def __init__(self, base_layer, hidden_size, num_streams=4, num_fracs=1, layer_index=0):
+    def __init__(self, base_layer, hidden_size, num_streams=4, num_fracs=1, layer_index=0,
+                 ablate_mapping=None, hres_init="identity", hres_init_noise_std=0.0):
         super().__init__()
         init_hyper_conn, _, _ = kromhc_get_init_and_expand_reduce_stream_functions(
             num_streams=num_streams,
             num_fracs=num_fracs,
             dim=hidden_size,
             layer_index=layer_index,
+            ablate_mapping=ablate_mapping,
+            hres_init=hres_init,
+            hres_init_noise_std=hres_init_noise_std,
         )
         self.attn_hc = init_hyper_conn(branch=_OlmoAttentionBranch(base_layer))
         self.mlp_hc  = init_hyper_conn(branch=_OlmoMLPBranch(base_layer))
@@ -688,7 +692,8 @@ class KromHCOlmoDecoderLayer(nn.Module):
 class KromHCOlmoModel(Olmo2Model):
     """OLMo model that carries KromHC streams folded into the batch dim, reduced once at the end."""
 
-    def __init__(self, base_model, hidden_size, num_streams=4, num_fracs=1):
+    def __init__(self, base_model, hidden_size, num_streams=4, num_fracs=1, ablate_mapping=None,
+                 hres_init="identity", hres_init_noise_std=0.0):
         super().__init__(base_model.config)
         self.num_streams = num_streams
         self.padding_idx = base_model.padding_idx
@@ -706,6 +711,8 @@ class KromHCOlmoModel(Olmo2Model):
             KromHCOlmoDecoderLayer(
                 base_layer=layer, hidden_size=hidden_size,
                 num_streams=num_streams, num_fracs=num_fracs, layer_index=i,
+                ablate_mapping=ablate_mapping,
+                hres_init=hres_init, hres_init_noise_std=hres_init_noise_std,
             )
             for i, layer in enumerate(base_model.layers)
         ])
@@ -830,12 +837,16 @@ def olmo_kromhc(
     olmo: nn.Module, 
     num_streams: int = 4, 
     num_fracs: int = 1,
-    ablate_mapping = None
+    ablate_mapping = None,
+    hres_init = "identity",
+    hres_init_noise_std = 0.0,
 ):
     """Replace olmo.model with a KromHC-based model (no double residual)."""
     hidden_size = olmo.config.hidden_size
     olmo.model = KromHCOlmoModel(
         base_model=olmo.model, hidden_size=hidden_size,
         num_streams=num_streams, num_fracs=num_fracs,
+        ablate_mapping=ablate_mapping,
+        hres_init=hres_init, hres_init_noise_std=hres_init_noise_std,
     )
     return olmo
